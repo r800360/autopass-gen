@@ -10,6 +10,7 @@ import operator
 import time
 import random
 import json
+import math
 from typing import TypedDict, Literal, Optional, Annotated, List
 from pydantic import BaseModel, Field
 from datetime import datetime
@@ -151,6 +152,12 @@ class PassingExecutionState(AggressionTrackingState):
     #   merge_back_maneuver: [{"lane_change": "left"/"right"}]
     # When no pass: both lists are empty
     passing_instructions: dict                # {"overtake_maneuver": [...], "merge_back_maneuver": [...]}
+    maneuver_state: str                       # "normal" | "move_but_not_pass"
+    move_but_not_pass_count: int
+    road_type: str                            # highway | urban | suburban
+    pending_replan_plan: list
+    original_plan_snapshot: list
+    replan_accepted: bool
 
 
 class ControlState(PassingExecutionState):
@@ -199,300 +206,60 @@ def pull_map_from_server() -> dict:
 
 
 # ============================================================
-# 3. PERCEPTION TOOLS (dummy — to be replaced by your group)
+# 3. PERCEPTION TOOLS (real segmentation + depth from visual/CARLA frames)
 # ============================================================
 
-def run_segmentation(rgb_image: np.ndarray) -> dict:
-    """
-    Segmentation model that identifies objects in the camera frame.
+import sys
+from pathlib import Path
 
-    YOUR GROUP WILL REPLACE THIS with a real model (e.g., Mask R-CNN,
-    YOLO-seg, or any instance segmentation network).
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
-    Args:
-        rgb_image: np.ndarray of shape (H, W, 3), uint8 RGB image
-                   from the ego vehicle's front-facing camera.
-
-    Returns:
-        dict with:
-            "car_masks": list of dicts, one per detected car:
-                - "bbox": [x1, y1, x2, y2] pixel coordinates
-                - "mask": np.ndarray (H, W) binary mask for this car
-                - "confidence": float 0-1
-                - "label": str, e.g. "car", "truck", "motorcycle"
-            "lane_lines": list of dicts, one per detected lane line:
-                - "points": list of [x, y] pixel coordinates along the line
-                - "type": "solid" or "dashed"
-                - "side": "left", "right", or "center"
-            "hazards": list of dicts for non-vehicle obstacles:
-                - "bbox": [x1, y1, x2, y2]
-                - "label": str, e.g. "pedestrian", "cone", "debris"
-                - "confidence": float 0-1
-            "drivable_area": np.ndarray (H, W) binary mask of drivable surface
-    """
-    # --- DUMMY IMPLEMENTATION ---
-    # Returns mock data that mimics what a real segmentation model would produce.
-    H, W = rgb_image.shape[:2] if rgb_image is not None else (720, 1280)
-
-    # Mock: detect 1-3 cars at random positions
-    num_cars = random.randint(1, 3)
-    car_masks = []
-    for i in range(num_cars):
-        cx = random.randint(W // 4, 3 * W // 4)
-        cy = random.randint(H // 3, 2 * H // 3)
-        bw, bh = random.randint(60, 150), random.randint(40, 100)
-        car_masks.append({
-            "bbox": [cx - bw // 2, cy - bh // 2, cx + bw // 2, cy + bh // 2],
-            "mask": np.zeros((H, W), dtype=np.uint8),  # placeholder
-            "confidence": round(random.uniform(0.7, 0.99), 2),
-            "label": random.choice(["car", "car", "car", "truck"]),
-        })
-
-    # Mock: detect lane lines
-    lane_lines = [
-        {"points": [[W // 3, H], [W // 3, H // 2]], "type": "dashed", "side": "left"},
-        {"points": [[2 * W // 3, H], [2 * W // 3, H // 2]], "type": "solid", "side": "right"},
-    ]
-
-    # Mock: no hazards most of the time
-    hazards = []
-    if random.random() < 0.1:
-        hazards.append({
-            "bbox": [random.randint(0, W - 50), random.randint(H // 2, H - 50),
-                      random.randint(50, W), random.randint(H // 2, H)],
-            "label": random.choice(["pedestrian", "cone", "debris"]),
-            "confidence": round(random.uniform(0.5, 0.9), 2),
-        })
-
-    return {
-        "car_masks": car_masks,
-        "lane_lines": lane_lines,
-        "hazards": hazards,
-        "drivable_area": np.ones((H, W), dtype=np.uint8),  # placeholder
-    }
+from perception.context import set_context as _set_perception_context
+from perception.pipeline import (
+    capture_multi_frame_perception,
+    run_depth_estimation,
+    run_segmentation,
+)
+try:
+    from agents import llm_agents
+except ImportError:
+    import llm_agents
 
 
-def run_depth_estimation(rgb_image: np.ndarray) -> dict:
-    """
-    Monocular depth estimation model that produces a depth map from a single
-    RGB image.
+def _sync_perception_context(state: AutoPassingState) -> None:
+    """Bind visual scenario world to perception when running integrated demo."""
+    vs = state.get("visual_scenario")
+    if not vs:
+        return
+    from visual_world import ScenarioSpec, WorldState
 
-    YOUR GROUP WILL REPLACE THIS with a real model (e.g., MiDaS, ZoeDepth,
-    Depth Anything, or stereo depth from Carla's depth camera).
-
-    Args:
-        rgb_image: np.ndarray of shape (H, W, 3), uint8 RGB image
-                   from the ego vehicle's front-facing camera.
-
-    Returns:
-        dict with:
-            "depth_map": np.ndarray of shape (H, W), float32, values in meters.
-                         Each pixel is the estimated distance from the camera.
-            "min_depth": float, closest object distance in meters
-            "max_depth": float, farthest estimated distance in meters
-            "car_distances": list of dicts, one per detected car region:
-                - "bbox": [x1, y1, x2, y2] pixel coordinates (same as segmentation)
-                - "median_depth": float, median depth within the car's bounding box (meters)
-                - "min_depth": float, closest point of the car (meters)
-                - "position": "front", "front_left", "front_right", "rear_left", "rear_right"
-                              relative to ego vehicle
-    """
-    # --- DUMMY IMPLEMENTATION ---
-    # Returns mock data that mimics what a real depth model would produce.
-    H, W = rgb_image.shape[:2] if rgb_image is not None else (720, 1280)
-
-    # Mock depth map: gradient from near (bottom) to far (top)
-    depth_map = np.linspace(5.0, 200.0, H).reshape(-1, 1).repeat(W, axis=1).astype(np.float32)
-    # Add some noise
-    depth_map += np.random.normal(0, 2.0, (H, W)).astype(np.float32)
-    depth_map = np.clip(depth_map, 1.0, 300.0)
-
-    # Mock car distances
-    car_distances = [
-        {
-            "bbox": [W // 2 - 75, H // 2 - 50, W // 2 + 75, H // 2 + 50],
-            "median_depth": round(random.uniform(20, 80), 1),
-            "min_depth": round(random.uniform(15, 70), 1),
-            "position": "front",
-        },
-    ]
-
-    # Sometimes add a car in the passing lane
-    if random.random() < 0.5:
-        car_distances.append({
-            "bbox": [W // 4 - 60, H // 2 - 40, W // 4 + 60, H // 2 + 40],
-            "median_depth": round(random.uniform(50, 200), 1),
-            "min_depth": round(random.uniform(40, 180), 1),
-            "position": random.choice(["front_left", "rear_left"]),
-        })
-
-    return {
-        "depth_map": depth_map,
-        "min_depth": float(np.min(depth_map)),
-        "max_depth": float(np.max(depth_map)),
-        "car_distances": car_distances,
-    }
+    spec = ScenarioSpec(**vs["spec"])
+    world = WorldState(**vs["world"])
+    backend = vs.get("backend", "visual")
+    _set_perception_context(spec, world, backend)
 
 
-# ============================================================
-# 3b. MULTI-FRAME PERCEPTION PIPELINE
-# ============================================================
-
-# Camera parameters (for estimating real-world car length from bbox)
-CAMERA_FOV_DEG = 90.0        # horizontal field of view in degrees
-CAMERA_WIDTH_PX = 1280       # image width in pixels
-CAMERA_FOCAL_PX = CAMERA_WIDTH_PX / (2 * np.tan(np.radians(CAMERA_FOV_DEG / 2)))
-
-
-def capture_multi_frame_perception(
-    num_frames: int = 5,
-    interval_s: float = 0.4,
-    image_shape: tuple = (720, 1280, 3),
-) -> dict:
-    """
-    Captures a burst of frames over a short time window and runs both
-    segmentation + depth estimation on each frame. Then computes derived
-    quantities from the sequence:
-
-    - front_car_speed: from change in front car depth across frames
-    - front_car_length: from segmentation bbox width + depth (pinhole model)
-    - back_car_closing_rate: from change in rear car depth across frames
-    - hazard_detected: True if any frame detected a hazard via segmentation
-
-    Args:
-        num_frames: number of frames to capture (default 5)
-        interval_s: seconds between frames (default 0.4 → 2.5 FPS over 2s)
-        image_shape: (H, W, 3) shape for the mock RGB images
-
-    Returns:
-        dict with:
-            "depth_result": the LAST frame's depth estimation output
-                            (used for distances — most recent snapshot)
-            "seg_result": the LAST frame's segmentation output
-            "front_car_speed": float, estimated speed in m/s
-            "front_car_length": float, estimated length in meters
-            "back_car_closing_rate": float, rate in m/s (positive = closing)
-            "hazard_detected": bool, True if any hazard seen in any frame
-            "num_frames": int, how many frames were actually processed
-    """
-    # Collect per-frame measurements
-    front_depths = []       # depth of closest front car per frame
-    rear_depths = []        # depth of closest rear car per frame
-    front_bboxes = []       # (bbox_width_px, depth) for car length estimation
-    any_hazard = False
-
-    last_depth_result = None
-    last_seg_result = None
-
-    for i in range(num_frames):
-        mock_rgb = np.zeros(image_shape, dtype=np.uint8)
-
-        depth_result = run_depth_estimation(mock_rgb)
-        seg_result = run_segmentation(mock_rgb)
-
-        last_depth_result = depth_result
-        last_seg_result = seg_result
-
-        # --- Track front car depth ---
-        front_cars = [c for c in depth_result["car_distances"]
-                      if c["position"] == "front"]
-        if front_cars:
-            closest = min(front_cars, key=lambda c: c["median_depth"])
-            front_depths.append(closest["median_depth"])
-            # Save bbox width for length estimation
-            bbox = closest["bbox"]  # [x1, y1, x2, y2]
-            bbox_width_px = bbox[2] - bbox[0]
-            front_bboxes.append((bbox_width_px, closest["median_depth"]))
-        else:
-            front_depths.append(None)
-
-        # --- Track rear car depth ---
-        rear_cars = [c for c in depth_result["car_distances"]
-                     if c["position"] in ("rear_left", "rear_right")]
-        if rear_cars:
-            closest_rear = min(rear_cars, key=lambda c: c["median_depth"])
-            rear_depths.append(closest_rear["median_depth"])
-        else:
-            rear_depths.append(None)
-
-        # --- Check for hazards in segmentation ---
-        if seg_result["hazards"]:
-            any_hazard = True
-
-    # ==========================================================
-    # Compute derived quantities from the frame sequence
-    # ==========================================================
-
-    # --- Front car speed ---
-    # Speed = change in depth / time between frames
-    # Use linear regression over all valid frames for a smoother estimate
-    valid_front = [(i, d) for i, d in enumerate(front_depths) if d is not None]
-    if len(valid_front) >= 2:
-        times = np.array([v[0] * interval_s for v in valid_front])
-        depths = np.array([v[1] for v in valid_front])
-        # depth_change_rate = how fast the front car's distance is changing
-        # Negative rate = car getting closer (ego faster), positive = pulling away
-        # Use polyfit for a simple linear fit: depth = slope * t + intercept
-        slope, _ = np.polyfit(times, depths, 1)
-        # The front car's speed relative to ego:
-        # If ego is going 15 m/s and depth is decreasing at 5 m/s,
-        # front car is going ~10 m/s
-        # front_car_relative_speed = -slope (positive slope = pulling away)
-        # Absolute speed = ego_speed + slope (slope negative = slower car)
-        # For now, estimate absolute speed as ego_speed + slope
-        # We'll use 15 m/s as default ego speed; the caller can override
-        front_car_speed = max(0.0, 15.0 + slope)  # clamp to non-negative
-    else:
-        front_car_speed = random.uniform(8, 14)  # fallback if not enough data
-
-    # --- Front car length ---
-    # Pinhole camera model: real_width = (bbox_width_px / focal_length_px) × depth
-    # This gives the width of the car. Length ≈ width × aspect_ratio (~2.0 for sedans)
-    CAR_LENGTH_TO_WIDTH_RATIO = 2.0
-    valid_lengths = []
-    for bbox_w, depth in front_bboxes:
-        if bbox_w > 0 and depth > 0:
-            real_width = (bbox_w / CAMERA_FOCAL_PX) * depth
-            estimated_length = real_width * CAR_LENGTH_TO_WIDTH_RATIO
-            # Clamp to reasonable range (2m motorcycle — 20m truck)
-            estimated_length = np.clip(estimated_length, 2.0, 20.0)
-            valid_lengths.append(estimated_length)
-
-    if valid_lengths:
-        front_car_length = float(np.median(valid_lengths))  # median for robustness
-    else:
-        front_car_length = 4.5  # fallback default sedan length
-
-    # --- Back car closing rate ---
-    # closing_rate = how fast the gap is shrinking (positive = closing in)
-    valid_rear = [(i, d) for i, d in enumerate(rear_depths) if d is not None]
-    if len(valid_rear) >= 2:
-        times_r = np.array([v[0] * interval_s for v in valid_rear])
-        depths_r = np.array([v[1] for v in valid_rear])
-        slope_r, _ = np.polyfit(times_r, depths_r, 1)
-        # Negative slope = distance decreasing = car closing in
-        back_car_closing_rate = -slope_r  # positive means closing
-    else:
-        back_car_closing_rate = 0.0  # fallback: assume not closing
-
-    return {
-        "depth_result": last_depth_result,
-        "seg_result": last_seg_result,
-        "front_car_speed": round(front_car_speed, 1),
-        "front_car_length": round(front_car_length, 1),
-        "back_car_closing_rate": round(back_car_closing_rate, 1),
-        "hazard_detected": any_hazard,
-        "num_frames": num_frames,
-    }
+def _infer_road_type(state: AutoPassingState) -> str:
+    plan = state.get("navigation_plan", [])
+    if not plan:
+        return "suburban"
+    wp = plan[state.get("current_waypoint_index", 0)]
+    street = (wp.get("street", "") if isinstance(wp, dict) else str(wp)).lower()
+    if "highway" in street:
+        return "highway"
+    if any(k in street for k in ("main", "university", "park")):
+        return "urban"
+    return "suburban"
 
 
 # ============================================================
 # 4. LLM SETUP
 # ============================================================
 
-# You can switch to any model — gpt-4o, claude, etc.
-# For now we use gpt-4o; replace with your preferred model
-llm = ChatOpenAI(model="gpt-4o", temperature=0)
+# Live LLM when AUTOPASS_MOCK_LLM=0 and OPENAI_API_KEY is set; otherwise llm_agents mocks.
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0) if not llm_agents.use_mock_llm() else None
 
 
 # ============================================================
@@ -511,6 +278,25 @@ def extract_travel_request(state: AutoPassingState) -> dict:
     The graph resumes when the user provides the answer.
     """
     travel_request = state["travel_request"]
+
+    if llm_agents.use_mock_llm():
+        parsed = llm_agents.parse_travel_request(travel_request)
+        starting_point = parsed.starting_point
+        if starting_point.lower() in ("unknown", "current_location", "not specified", ""):
+            starting_point = interrupt("What is your current location?") if not state.get("starting_point") else state["starting_point"]
+        return {
+            "starting_point": starting_point,
+            "goal": parsed.goal,
+            "aggressive_level": parsed.aggressive_level,
+            "original_aggressive_level": parsed.aggressive_level,
+            "maneuver_state": "normal",
+            "move_but_not_pass_count": 0,
+            "road_type": "suburban",
+            "pending_replan_plan": [],
+            "original_plan_snapshot": [],
+            "replan_accepted": False,
+            "messages": [HumanMessage(content=f"Travel request parsed: {starting_point} → {parsed.goal}, aggression: {parsed.aggressive_level}")],
+        }
 
     structured_llm = llm.with_structured_output(TravelRequest)
 
@@ -582,11 +368,23 @@ def navigate(state: AutoPassingState) -> dict:
 
     passing_signal = state.get("passing_signal", "")
     has_plan = len(state.get("navigation_plan", [])) > 0
+    _sync_perception_context(state)
+
+    # Apply pending replan if navigation received one and plans match on re-evaluation
+    pending = state.get("pending_replan_plan") or []
+    if pending and state.get("replan_accepted"):
+        return {
+            "navigation_plan": pending,
+            "pending_replan_plan": [],
+            "replan_accepted": False,
+            "passing_available": False,
+            "messages": [AIMessage(content="NAVIGATE: Adopted replanned route after matching evaluation.")],
+        }
 
     # ==============================================
     # MODE 2: Generate passing plan (return visit)
     # ==============================================
-    if passing_signal in ("pass", "no_pass"):
+    if passing_signal in ("pass", "no_pass", "move_but_not_pass"):
 
         sensor = SensorData(**state["sensor_data"])
 
@@ -625,39 +423,54 @@ Generate:
 3. route_after_pass: updated waypoints from the post-pass position to the destination
 4. reasoning: briefly explain the route adjustment
 """
-            structured_passing_llm = llm.with_structured_output(PassingPlan)
-            plan_result = structured_passing_llm.invoke(
-                [SystemMessage(content=replan_prompt),
-                 HumanMessage(content="Generate the passing maneuver plan and replan the route.")]
-            )
-
-            passing_instructions = {
-                "overtake_maneuver": [step.model_dump() for step in plan_result.overtake_maneuver],
-                "merge_back_maneuver": [step.model_dump() for step in plan_result.merge_back_maneuver],
-            }
+            if llm_agents.use_mock_llm():
+                passing_instructions = {
+                    "overtake_maneuver": [{"lane_change": passing_side, "acceleration": accel, "accelerate_time": req_time}],
+                    "merge_back_maneuver": [{"lane_change": merge_back_side}],
+                }
+                route_after = state.get("navigation_plan", []) or [
+                    {"street": "Highway 5", "action": "drive", "speed": 22.0}
+                ]
+                plan_result_reason = "Mock passing plan"
+            else:
+                structured_passing_llm = llm.with_structured_output(PassingPlan)
+                plan_result = structured_passing_llm.invoke(
+                    [SystemMessage(content=replan_prompt),
+                     HumanMessage(content="Generate the passing maneuver plan and replan the route.")]
+                )
+                passing_instructions = {
+                    "overtake_maneuver": [step.model_dump() for step in plan_result.overtake_maneuver],
+                    "merge_back_maneuver": [step.model_dump() for step in plan_result.merge_back_maneuver],
+                }
+                route_after = [wp.model_dump() for wp in plan_result.route_after_pass]
+                plan_result_reason = plan_result.reasoning
 
             return {
                 "passing_instructions": passing_instructions,
-                "navigation_plan": [wp.model_dump() for wp in plan_result.route_after_pass],
+                "navigation_plan": route_after,
                 "current_position": "post_pass_position",
                 "passing_available": False,
                 "messages": [AIMessage(content=(
-                    f"NAVIGATE Mode 2 → LLM PASS plan:\n"
-                    f"  Reasoning: {plan_result.reasoning}\n"
+                    f"NAVIGATE Mode 2 → PASS plan:\n"
+                    f"  Reasoning: {plan_result_reason}\n"
                     f"  Overtake: {json.dumps(passing_instructions['overtake_maneuver'])}\n"
                     f"  Merge back: {json.dumps(passing_instructions['merge_back_maneuver'])}\n"
-                    f"  Route replanned: {len(plan_result.route_after_pass)} waypoints"
+                    f"  Route replanned: {len(route_after)} waypoints"
                 ))],
             }
 
-        else:
-            # No pass — empty instructions, plan unchanged
+        elif passing_signal == "move_but_not_pass":
             return {
-                "passing_instructions": {
-                    "overtake_maneuver": [],
-                    "merge_back_maneuver": [],
-                },
+                "passing_instructions": {"overtake_maneuver": [], "merge_back_maneuver": []},
                 "passing_available": False,
+                "maneuver_state": "move_but_not_pass",
+                "messages": [AIMessage(content="NAVIGATE Mode 2 → MOVE BUT NOT PASS: shift lane without full overtake.")],
+            }
+        else:
+            return {
+                "passing_instructions": {"overtake_maneuver": [], "merge_back_maneuver": []},
+                "passing_available": False,
+                "maneuver_state": "normal",
                 "messages": [AIMessage(content="NAVIGATE Mode 2 → NO PASS: Empty instructions, plan unchanged.")],
             }
 
@@ -818,11 +631,19 @@ Generate:
     # MODE 1: Plan route (first visit)
     # ==============================================
 
-    # --- Pull map from server (long-term memory) ---
     city_map = pull_map_from_server()
 
-    # --- LLM generates the navigation plan ---
-    route_prompt = f"""You are a navigation planner for an autonomous vehicle.
+    if llm_agents.use_mock_llm():
+        plan = [
+            {"street": "Main Street", "action": "drive", "speed": 15.0},
+            {"street": "Highway 5", "action": "merge", "speed": 25.0},
+            {"street": "Harbor Drive", "action": "drive", "speed": 20.0},
+        ]
+        trip_eta = 45.0
+        nav_description = f"Mock route to {state.get('goal', 'destination')}"
+        passing_opportunities = ["Highway 5"]
+    else:
+        route_prompt = f"""You are a navigation planner for an autonomous vehicle.
 Using the city map below, plan a route from the starting point to the destination.
 
 CITY MAP (long-term memory from patrolling):
@@ -839,15 +660,15 @@ Generate:
 3. estimated_time_s: estimated travel time in seconds
 4. passing_opportunities: which street segments have multiple lanes where passing could happen
 """
-    structured_nav_llm = llm.with_structured_output(NavigationPlan)
-    nav_result = structured_nav_llm.invoke(
-        [SystemMessage(content=route_prompt),
-         HumanMessage(content="Plan the route.")]
-    )
-
-    # Convert Waypoint Pydantic objects to plain dicts for state storage
-    plan = [wp.model_dump() for wp in nav_result.waypoints]
-    trip_eta = nav_result.estimated_time_s
+        structured_nav_llm = llm.with_structured_output(NavigationPlan)
+        nav_result = structured_nav_llm.invoke(
+            [SystemMessage(content=route_prompt),
+             HumanMessage(content="Plan the route.")]
+        )
+        plan = [wp.model_dump() for wp in nav_result.waypoints]
+        trip_eta = nav_result.estimated_time_s
+        nav_description = nav_result.route_description
+        passing_opportunities = nav_result.passing_opportunities
 
     # Compute depth check interval based on urgency
     # check_interval = 1 / probability
@@ -925,11 +746,11 @@ Generate:
         "messages": [AIMessage(content=(
             f"NAVIGATE Mode 1 → Plan route:\n"
             f"  Map: {city_map.get('city', 'unknown')} v{city_map.get('version', '?')}\n"
-            f"  Route: {nav_result.route_description}\n"
+            f"  Route: {nav_description}\n"
             f"  Waypoints: {len(plan)}\n"
             f"  ETA: {trip_eta:.0f}s\n"
             f"  Depth check interval: {depth_check_interval:.2f}s (urgency={aggressive_level})\n"
-            f"  Passing opportunities: {nav_result.passing_opportunities}\n"
+            f"  Passing opportunities: {passing_opportunities}\n"
             f"  passing_available: {passing_available}"
         ))],
     }
@@ -937,6 +758,7 @@ Generate:
 
 # --- Node 3: Passing Lane Front Agent (deterministic + depth estimation) ---
 def check_passing_lane_front(state: AutoPassingState) -> dict:
+    _sync_perception_context(state)
     """
     Uses DEPTH ESTIMATION to check the passing lane ahead.
 
@@ -1006,23 +828,13 @@ def check_passing_lane_front(state: AutoPassingState) -> dict:
     }
 
 
-# --- Node 4: Passing Lane Back Agent (deterministic + depth estimation) ---
+# --- Node 4: Passing Lane Back Agent (LLM required passing time + code safety check) ---
 def check_passing_lane_back(state: AutoPassingState) -> dict:
-    """
-    Uses DEPTH ESTIMATION to check the passing lane behind.
-
-    Reads passing_side from the Front agent to know which side to check.
-    If Front agent didn't approve any side (passing_side is empty),
-    this node automatically denies.
-
-    Approves if:
-    1. No car detected behind in passing lane, OR distance > MINIMUM_DISTANCE
-    2. The car is not closing faster than CLOSING_RATE_THRESHOLD
-    """
+    """LLM estimates lane-change duration; code checks rear car will not hit ego during that window."""
+    _sync_perception_context(state)
     sensor = SensorData(**state["sensor_data"])
     passing_side = state.get("passing_side", "")
 
-    # If Front agent didn't approve any side, skip
     if not passing_side:
         return {
             "back_approval": False,
@@ -1031,40 +843,33 @@ def check_passing_lane_back(state: AutoPassingState) -> dict:
 
     mock_rgb = np.zeros((720, 1280, 3), dtype=np.uint8)
     depth_result = run_depth_estimation(mock_rgb)
-
-    # Check the same side that Front agent approved
     position_key = f"rear_{passing_side}"
-    rear_cars = [
-        c for c in depth_result["car_distances"]
-        if c["position"] == position_key
-    ]
-
-    CLOSING_RATE_THRESHOLD = 3.0  # m/s
-    MINIMUM_DISTANCE = 30.0       # meters
+    rear_cars = [c for c in depth_result["car_distances"] if c["position"] == position_key]
 
     if not rear_cars:
         distance = float("inf")
-        closing_rate = 0.0
-        approved = True
-        detail = f"no car detected behind on {passing_side}"
+        closing_rate = sensor.back_car_closing_rate
     else:
         closest = min(rear_cars, key=lambda c: c["median_depth"])
         distance = closest["median_depth"]
+        closing_rate = max(0.0, sensor.back_car_closing_rate)
 
-        prev_distance = sensor.back_car_distance
-        dt = 1.0
-        closing_rate = (prev_distance - distance) / dt
-
-        approved = (
-            distance > MINIMUM_DISTANCE
-            and closing_rate < CLOSING_RATE_THRESHOLD
-        )
-        detail = f"{passing_side}: distance={distance:.1f}m, closing_rate={closing_rate:.1f}m/s"
-
+    estimate = llm_agents.estimate_rear_passing_time(
+        back_distance_m=distance if math.isfinite(distance) else sensor.back_car_distance,
+        back_closing_rate_mps=closing_rate,
+        ego_speed_mps=sensor.ego_speed,
+        passing_side=passing_side,
+    )
+    req_time = estimate.required_lane_change_time_s
+    time_to_reach = (distance / closing_rate) if closing_rate > 0.1 else float("inf")
+    approved = time_to_reach > req_time + 1.5
+    detail = (
+        f"{passing_side}: rear_gap={distance:.1f}m, closing={closing_rate:.1f}m/s, "
+        f"LLM_lane_change_time={req_time:.1f}s, time_to_reach={time_to_reach:.1f}s"
+    )
     return {
         "back_approval": approved,
-        "messages": [AIMessage(content=f"Passing Lane Back [depth, {passing_side} side]: "
-                               f"{'APPROVED' if approved else 'DENIED'} ({detail})")],
+        "messages": [AIMessage(content=f"Passing Lane Back [LLM+code]: {'APPROVED' if approved else 'DENIED'} ({detail})")],
     }
 
 
@@ -1118,8 +923,11 @@ def analyze_current_lane(state: AutoPassingState) -> dict:
       - Must have: denominator > 0 (ego's average speed must exceed front car)
 
     If approved, computes acceleration and stores physics in state for Navigate Mode 2.
+    If lane is clear but pass time exceeds limit → move_but_not_pass (LLM traffic check next).
     """
+    _sync_perception_context(state)
     sensor = SensorData(**state["sensor_data"])
+    road_type = _infer_road_type(state)
 
     # ---- Step 1: Multi-frame perception (5 frames over 2 seconds) ----
     perception = capture_multi_frame_perception(num_frames=5, interval_s=0.4)
@@ -1192,13 +1000,18 @@ def analyze_current_lane(state: AutoPassingState) -> dict:
     else:
         reasons.append(f"✓ Enough clear road to complete the pass")
 
-    # ---- Step 4: Kinematics check ----
+    # ---- Step 4: Kinematics check (LLM target velocity + code physics) ----
+    maneuver_state = "normal"
+    move_but_not_pass = False
     if approved:
-        target_velocity = min(1.5 * front_car_speed, sensor.speed_limit)
+        vel_decision = llm_agents.decide_target_velocity(
+            front_car_speed, sensor.speed_limit, road_type, sensor.ego_speed
+        )
+        target_velocity = vel_decision.target_speed_mps
         ego_avg_speed = 0.5 * (sensor.ego_speed + target_velocity)
         denominator = ego_avg_speed - front_car_speed
 
-        reasons.append(f"  Target velocity: {target_velocity:.1f} m/s (1.5 × {front_car_speed:.1f}, capped at {sensor.speed_limit:.1f})")
+        reasons.append(f"  Target velocity (LLM): {target_velocity:.1f} m/s — {vel_decision.reasoning}")
         reasons.append(f"  Ego avg speed during pass: {ego_avg_speed:.1f} m/s")
         reasons.append(f"  Relative avg speed advantage: {denominator:.1f} m/s")
 
@@ -1208,25 +1021,31 @@ def analyze_current_lane(state: AutoPassingState) -> dict:
         else:
             required_time = pass_distance / denominator
             acceleration = (target_velocity - sensor.ego_speed) / required_time if required_time > 0 else 0.0
-
             reasons.append(f"  Required time: {required_time:.2f}s")
             reasons.append(f"  Acceleration needed: {acceleration:.2f} m/s²")
-
             if required_time > MAX_PASS_TIME:
-                reasons.append(f"✗ Pass takes too long ({required_time:.1f}s > {MAX_PASS_TIME}s max)")
+                reasons.append(f"⚠ Pass slower than limit ({required_time:.1f}s > {MAX_PASS_TIME}s) → move_but_not_pass")
                 approved = False
+                move_but_not_pass = True
+                maneuver_state = "move_but_not_pass"
             else:
                 reasons.append(f"✓ Pass feasible in {required_time:.1f}s (within {MAX_PASS_TIME}s limit)")
 
-    result = "approve" if approved else "disapprove"
+    if move_but_not_pass:
+        result = "move_but_not_pass"
+    else:
+        result = "approve" if approved else "disapprove"
 
     return {
         "current_lane_result": result,
+        "maneuver_state": maneuver_state,
+        "road_type": road_type,
         "passing_target_velocity": round(target_velocity, 2),
         "passing_acceleration": round(acceleration, 2),
         "passing_required_time": round(required_time, 2),
+        "lane_density": perception.get("lane_density_cars_per_100m", 0.0),
         "messages": [AIMessage(content=(
-            f"Current Lane Analysis [multi-frame perception]: {result}\n"
+            f"Current Lane Analysis [seg+depth+LLM velocity]: {result}\n"
             + "\n".join(reasons)
         ))],
     }
@@ -1251,11 +1070,19 @@ def send_passing_signal(state: AutoPassingState) -> dict:
     current_lane_result = state.get("current_lane_result", "")
 
     if checker_result == "approved" and current_lane_result == "approve":
-        # Both checker and current lane agree → PASS
         return {
             "passing_signal": "pass",
-            "consecutive_disapprovals": 0,  # Reset on successful pass
+            "maneuver_state": "normal",
+            "consecutive_disapprovals": 0,
             "messages": [AIMessage(content="SIGNAL → PASS: All checks passed, sending pass signal to Navigate.")],
+        }
+    if checker_result == "approved" and current_lane_result == "move_but_not_pass":
+        count = state.get("move_but_not_pass_count", 0) + 1
+        return {
+            "passing_signal": "move_but_not_pass",
+            "maneuver_state": "move_but_not_pass",
+            "move_but_not_pass_count": count,
+            "messages": [AIMessage(content=f"SIGNAL → MOVE BUT NOT PASS (#{count}); routing to traffic-check agents.")],
         }
     else:
         # Either checker failed or current lane denied → NO PASS
@@ -1291,6 +1118,57 @@ def send_passing_signal(state: AutoPassingState) -> dict:
             "aggression_lowered_until": lowered_until,
             "messages": [AIMessage(content=messages_content)],
         }
+
+
+# --- Tier 3/4 LLM agents: traffic check + replan (redesigned architecture) ---
+def traffic_check_agent(state: AutoPassingState) -> dict:
+    _sync_perception_context(state)
+    sensor = SensorData(**state["sensor_data"])
+    decision = llm_agents.traffic_check(
+        move_but_not_pass_count=state.get("move_but_not_pass_count", 0),
+        ego_speed_mps=sensor.ego_speed,
+        speed_limit_mps=sensor.speed_limit,
+        road_type=state.get("road_type", _infer_road_type(state)),
+        lane_density=state.get("lane_density", 0.0),
+    )
+    seg = run_segmentation(np.zeros((720, 1280, 3), dtype=np.uint8))
+    density = len(seg.get("car_masks", [])) * 4.5 / 100.0
+    return {
+        "traffic_needs_check": decision.needs_traffic_check,
+        "traffic_is_real": decision.is_real_traffic if decision.needs_traffic_check else False,
+        "lane_density": density,
+        "messages": [AIMessage(content=f"Traffic Check LLM: needs_check={decision.needs_traffic_check}, real_traffic={decision.is_real_traffic}. {decision.reasoning}")],
+    }
+
+
+def road_condition_agent(state: AutoPassingState) -> dict:
+    assessment = llm_agents.assess_road(state.get("lane_density", 0.0), state.get("road_type", "suburban"))
+    return {
+        "road_type": assessment.road_type,
+        "lane_density": assessment.lane_density,
+        "messages": [AIMessage(content=f"Road Condition LLM: {assessment.road_type}, density={assessment.lane_density:.2f}. {assessment.reasoning}")],
+    }
+
+
+def replan_decision_agent(state: AutoPassingState) -> dict:
+    plan = state.get("navigation_plan", [])
+    decision = llm_agents.replan_route(
+        goal=state.get("goal", "destination"),
+        current_plan=plan,
+        lane_density=state.get("lane_density", 0.0),
+        trip_eta=state.get("trip_eta", 60.0),
+    )
+    same = llm_agents.plans_are_same(plan, decision.waypoints) if decision.should_replan else True
+    accept = decision.should_replan and not same
+    return {
+        "pending_replan_plan": decision.waypoints if accept else [],
+        "replan_accepted": accept,
+        "original_plan_snapshot": plan if accept else state.get("original_plan_snapshot", []),
+        "passing_signal": "no_pass",
+        "messages": [AIMessage(content=(
+            f"Replan Decision LLM: should_replan={decision.should_replan}, same={same}, accepted={accept}. {decision.reasoning}"
+        ))],
+    }
 
 
 # --- Node 8: Carla Executor (drives the car, loops back) ---
@@ -1366,6 +1244,22 @@ def route_after_navigation(state: AutoPassingState) -> str:
         return "carla_executor"
 
 
+def route_after_current_lane(state: AutoPassingState) -> str:
+    if state.get("current_lane_result") == "move_but_not_pass":
+        return "traffic_check"
+    return "send_passing_signal"
+
+
+def route_after_traffic(state: AutoPassingState) -> str:
+    if state.get("traffic_is_real", False):
+        return "road_condition"
+    return "send_passing_signal"
+
+
+def route_after_replan(state: AutoPassingState) -> str:
+    return "navigate"
+
+
 def route_after_checker(state: AutoPassingState) -> str:
     """
     After Checker, decide whether to run the expensive current lane analysis:
@@ -1419,6 +1313,9 @@ def build_autopassing_graph(checkpointer=MemorySaver()):
     builder.add_node("check_passing_back", check_passing_lane_back)
     builder.add_node("checker", checker)
     builder.add_node("analyze_current_lane", analyze_current_lane)
+    builder.add_node("traffic_check", traffic_check_agent)
+    builder.add_node("road_condition", road_condition_agent)
+    builder.add_node("replan_decision", replan_decision_agent)
     builder.add_node("send_passing_signal", send_passing_signal)
     builder.add_node("carla_executor", carla_executor)
     builder.add_node("farewell", farewell)
@@ -1467,8 +1364,18 @@ def build_autopassing_graph(checkpointer=MemorySaver()):
         }
     )
 
-    # Current Lane → send_passing_signal
-    builder.add_edge("analyze_current_lane", "send_passing_signal")
+    builder.add_conditional_edges(
+        "analyze_current_lane",
+        route_after_current_lane,
+        {"traffic_check": "traffic_check", "send_passing_signal": "send_passing_signal"},
+    )
+    builder.add_conditional_edges(
+        "traffic_check",
+        route_after_traffic,
+        {"road_condition": "road_condition", "send_passing_signal": "send_passing_signal"},
+    )
+    builder.add_edge("road_condition", "replan_decision")
+    builder.add_edge("replan_decision", "navigate")
 
     # *** CLOSED LOOP ***
     # send_passing_signal loops BACK to Navigate

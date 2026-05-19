@@ -1,0 +1,105 @@
+# Python cache/build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Packaging/build outputs
+build/
+dist/
+*.egg-info/
+src/*.egg-info/
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Generated experiment outputs
+runs/
+outputs/
+logs/
+artifacts/
+
+# Keep a placeholder for folder structure in Git
+!runs/.gitkeep
+
+# Generated scenario batches
+configs/generated*/
+configs/generated_*/
+configs/tmp*/
+configs/scratch*/
+configs/workshop*/
+demos/workshop*/
+workshop*
+
+# Keep hand-written/example configs
+!configs/example_scenario.json
+
+# Local CARLA/video/sensor artifacts
+*.log
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.png
+*.jpg
+*.jpeg
+
+# But allow figures/images used in the paper/docs
+!paper/*.png
+!paper/*.jpg
+!paper/*.jpeg
+!paper/results/*.png
+!paper/results/*.jpg
+!paper/results/*.jpeg
+!slides/*.png
+!docs/*.png
+!docs/*.jpg
+!docs/*.jpeg
+
+# LaTeX build artifacts
+*.aux
+*.bbl
+*.blg
+*.brf
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.synctex.gz
+*.toc
+*.lof
+*.lot
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+
+# Jupyter notebooks checkpoints, if any
+.ipynb_checkpoints/
+
+# Large local simulator/CARLA dumps
+carla_out/
+recordings/
+videos/
+sensor_dumps/
+
+#LLM
+.claude*
+.cursor*
+CLAUDE*
+CURSOR*
