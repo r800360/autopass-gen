@@ -46,7 +46,8 @@ class ReplanDecision(BaseModel):
 
 
 def use_mock_llm() -> bool:
-    return os.environ.get("AUTOPASS_MOCK_LLM", "1").strip() not in ("0", "false", "False")
+    from autopass.config import mock_llm_enabled
+    return mock_llm_enabled()
 
 
 def structured_invoke(model: Type[T], system: str, human: str, mock_value: T) -> T:

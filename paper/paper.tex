@@ -1,0 +1,208 @@
+\documentclass[10pt,twocolumn,letterpaper]{article}
+
+\usepackage{cvpr}
+\usepackage{times}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage[pagebackref,breaklinks,colorlinks,allcolors=blue]{hyperref}
+\usepackage{enumitem}
+\usepackage{xspace}
+
+\cvprfinalcopy
+
+\def\cvprPaperID{****}
+\def\confName{CSE 252D}
+\def\confYear{Spring 2026}
+
+\begin{document}
+
+\title{AutoPass-Gen: Greedy Urgency-Aware Overtaking with Multi-Agent, Vision-Grounded Planning}
+
+\author{
+Rohan Sachdeva \quad Xinwei Mai \quad Pranav Prabu \quad Rathang Pandit \\
+University of California, San Diego \\
+{\tt\small \{rosachdeva, xmai, pprabu, rpandit\}@ucsd.edu}
+}
+
+\maketitle
+
+\begin{abstract}
+Today's autonomous driving stacks are often \textbf{safe but time-inefficient}: staying in one lane avoids risk but misses deadlines when a lead vehicle is slow.
+We study \textbf{when} an autonomous vehicle may pass safely under urgency, using a \textbf{greedy} policy---attempt a pass when perception and checkers approve---orchestrated as a \textbf{LangGraph multi-agent} system.
+\textbf{Code} agents measure gaps from \textbf{depth and semantic segmentation}; \textbf{LLM} agents handle rear closing-time judgment, target speed, traffic classification, and route replanning.
+A working prototype includes curated highway scenarios, RGB/seg/depth panels, 16 automated tests, optional CARLA visualization, and message traces that explain each pass/wait/replan decision.
+\end{abstract}
+
+\section{Problem}
+Autonomous driving is often evaluated on comfort and collision avoidance alone.
+For ride-hailing and emergency-style trips, \textbf{time efficiency} matters equally: always staying in the same lane is the safest baseline but can violate trip deadlines.
+The maneuver we focus on is \textbf{overtaking a slow lead vehicle} on a two-lane road: the ego must decide whether to \textbf{pass}, \textbf{wait}, or \textbf{replan} while reading passing-lane gaps, rear traffic, oncoming risk, visibility, speed limits, and user urgency.
+
+\textbf{Research question:} \emph{Can a multi-agent planner that combines vision tools with selective LLM judgment improve travel time while preserving hard safety gates?}
+
+\textbf{Design assumption:} structured LLM calls can approximate near-optimal contextual decisions (target speed, traffic vs.\ geometry, replan need) when grounded in measured perception---we treat this as an engineering hypothesis to test, not a proven optimality bound.
+
+\textbf{Experimental hypothesis:} a hybrid \textbf{code + LLM} multi-agent stack reduces delay versus a never-pass baseline while keeping unsafe-pass rates near zero, relative to an aggressive always-pass baseline.
+
+\section{Motivation}
+\textbf{Greedy efficiency under urgency.}
+We take a deliberate \textbf{greedy} stance: when urgency is high and checkers approve, the vehicle should pass rather than indefinitely queue behind a slow lead.
+When checkers deny, the vehicle waits, creeps in the passing lane without completing the maneuver (\emph{move but not pass}), or triggers replanning.
+
+\textbf{Why passing is the right slice.}
+Passing is narrow enough to implement and audit, yet it captures the safety--efficiency tension.
+A fully conservative policy never passes and fails time-sensitive tasks; an urgency-blind aggressive policy risks collisions.
+
+\textbf{Real-world stakes.}
+Emergency vehicles illustrate urgency: delay can harm outcomes even when the road looks ``safe enough'' to wait.
+Conversely, human passing errors cause fatalities---e.g., the State Highway~36 crash in Ohio (2023)---when drivers misjudge gaps or oncoming traffic.
+Our system separates \textbf{measurement} (depth/segmentation distances, kinematics) from \textbf{judgment} (LLM rear-time and speed context) so decisions are inspectable, not a single opaque threshold.
+
+\section{Key Background Literature}
+CARLA~\cite{dosovitskiy2017carla} provides repeatable towns, weather, and RGB/depth/semantic sensors for closing the loop between perception and planning.
+Conditional imitation and privileged training~\cite{codevilla2018conditional,chen2019learning} study how policies learn to drive but do not specify \emph{which} overtaking decisions are safe under deadline pressure.
+Our contribution is a \textbf{decision-layer architecture} for overtaking: explicit agent roles, tool use (segmentation, depth, map), and traces suitable for course evaluation and TA review---not a full end-to-end learned controller.
+
+\section{System Architecture}
+We \textbf{remove} the prior closed-loop generator--mutator diagram (former Fig.~2) because it mixed research evaluation with the driving pipeline and confused reviewers.
+The \textbf{authoritative flow} is the passing pipeline in Fig.~\ref{fig:pipeline}, implemented as a LangGraph graph (\texttt{agents/autopassing.py}) plus a complementary visual closed-loop prototype (\texttt{autopass\_langgraph\_demo.py}).
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{passing-diagram.png}
+    \caption{\textbf{Reference passing pipeline} (Xinwei Mai).
+    Natural-language request $\rightarrow$ navigation plan $\rightarrow$ passing-lane front/back checks $\rightarrow$ checker $\rightarrow$ current-lane analysis (segmentation + depth) $\rightarrow$ pass / no-pass / replan $\rightarrow$ executor.
+    We implement this as named LangGraph nodes; red paths indicate plan updates after a pass or accepted replan.}
+    \label{fig:pipeline}
+\end{figure}
+
+\textbf{End-to-end path when \texttt{passing\_available} is true:}
+\begin{enumerate}[leftmargin=*,itemsep=1pt,topsep=2pt]
+\item \textbf{Input:} travel request (e.g., ``airport in 10 minutes'') $\rightarrow$ \textbf{LLM parser} extracts start, goal, aggression/urgency.
+\item \textbf{Navigate (Mode 1):} LLM builds a waypoint plan using an optional city map server (JSON streets/landmarks); this is \emph{not} the CARLA map.
+\item \textbf{Condition checking:} \textbf{code} front gap from depth; \textbf{LLM + code} rear gap (LLM estimates required lane-change time, code verifies closing rate); \textbf{code} checker requires two approvals.
+\item \textbf{Move / sense:} shift to passing lane context; burst capture of RGB, segmentation, depth.
+\item \textbf{Passing decision:} \textbf{code} road length and kinematics; \textbf{LLM} target velocity; outcomes: \texttt{pass}, \texttt{no\_pass}, or \texttt{move\_but\_not\_pass}.
+\item \textbf{Traffic tier (if needed):} \textbf{LLM} decides whether repeated denials are real traffic; segmentation estimates lane density; \textbf{LLM} may propose a new route.
+\item \textbf{Replan evaluation:} adopt a new plan only if it is structurally consistent with verification (implemented: waypoint agreement check; target: deterministic A* on the same map graph).
+\item \textbf{Navigate (Mode 2/3) + executor:} merge passing instructions, advance waypoints, loop until arrival.
+\end{enumerate}
+
+\textbf{What is \emph{not} fully learned.}
+Front/back/checker/kinematics nodes are \textbf{deterministic} on structured perception outputs.
+LLMs are invoked for parsing, rear time, target speed, traffic/replan---with mockable structured outputs for reproducible demos (\texttt{AUTOPASS\_MOCK\_LLM=1}).
+
+\section{Representations and Scenario DSL}
+Each trial uses a typed \texttt{ScenarioSpec}:
+route, synthetic \texttt{request} (text, start, goal, deadline), ego/lead/rear/oncoming vehicles, occlusion, weather, and sensor noise.
+Runtime \texttt{WorldState} tracks longitudinal positions, lane index, speeds, and flags (\texttt{passed}, \texttt{collision}, \texttt{done}).
+
+\textbf{Where numbers come from (TA clarity).}
+Scenes are \textbf{curated 1D highway layouts} rendered to top-down RGB, Cityscapes-style semantic masks, and metric depth (\texttt{visual\_world.py}).
+Distances fed to agents are extracted from \textbf{labeled vehicle masks and depth}, not from hidden simulator coordinates---matching the course ``world vision'' requirement.
+Optional CARLA (\texttt{perception/carla\_scenario.py}) spawns four actors and attaches ego cameras; watch demos animate logical \texttt{WorldState} into actor poses (staged motion, not full low-level control yet).
+
+Per-timestep \texttt{PassState} includes front/rear/oncoming gaps, visibility, deadline pressure, urgency, proposed action, and safety reasons---logged to JSON traces and multi-agent message files.
+
+\section{Agent Roles}
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+Agent / node & Type & Role \\
+\midrule
+Input extractor & LLM & Parse request, urgency \\
+Navigate & LLM + map & Plan route; Modes 1--3 \\
+Passing-lane front & Code + depth & Gap ahead in passing lane \\
+Passing-lane back & LLM + code & Rear closing time \\
+Checker & Code & Two approvals required \\
+Current lane & Code + seg/depth & Road length, kinematics \\
+Target velocity & LLM & Feasible pass speed \\
+Traffic / road / replan & LLM + seg & Traffic vs.\ layout \\
+Send passing signal & Code & \texttt{pass} / \texttt{no\_pass} / \ldots \\
+Carla executor & Code & Advance drive step \\
+\bottomrule
+\end{tabular}
+\caption{Division of labor: measure with tools, judge with LLMs where context matters.}
+\label{tab:agents}
+\vspace{-6pt}
+\end{table}
+
+A parallel \textbf{visual LangGraph} (\texttt{autopass\_langgraph\_demo.py}) implements interpret $\rightarrow$ perceive $\rightarrow$ plan $\rightarrow$ safety $\rightarrow$ execute with the same three actions for ablations (\texttt{autopass}, \texttt{no-pass}, \texttt{aggressive}).
+
+\section{Method Overview}
+\textbf{Greedy passing rule.}
+If urgency is high and all gates approve, pass; otherwise wait or replan.
+After three denials within 30\,s, aggression is temporarily lowered---matching the diagram's ``lower threshold'' feedback.
+
+\textbf{Safety does not yield to urgency.}
+Unsafe rear gap, short oncoming window, obstacles in segmentation, or failed kinematics force \texttt{no\_pass} regardless of deadline pressure.
+
+\textbf{Target velocity (LLM + code).}
+Naive ``$1.5\times$ lead speed'' can imply impossible speeds; an LLM proposes a feasible target given front speed, limit, and road type; code computes required pass time and rejects infeasible maneuvers.
+
+\textbf{Replanning.}
+When \texttt{move\_but\_not\_pass} repeats, traffic-check and road-condition LLMs decide if congestion is genuine; replan proposes alternate waypoints.
+Navigation adopts the new plan only if verification agrees (\texttt{plans\_are\_same}); mismatches are discarded so inconsistent LLM routes do not override the active plan.
+
+\section{Working Prototype and Implementation}
+\textbf{Repository artifacts:} \texttt{demo.py} (quick multi-agent run), \texttt{demo\_carla\_watch.py} (CARLA + MP4), \texttt{carla\_smoke.py}, \texttt{pytest} suite (16 tests).
+
+\textbf{Perception tools:} \texttt{run\_segmentation}, \texttt{run\_depth\_estimation}, multi-frame burst in \texttt{analyze\_current\_lane} and Navigate Mode~3.
+
+\textbf{Outputs for presentation:} (i) four-panel figure (world + RGB + seg + depth + extracted distances), (ii) \texttt{*\_messages.txt} reasoning trace, (iii) optional \texttt{*\_visual\_loop.mp4} or \texttt{*\_multi\_agent.mp4}.
+
+\textbf{Honest scope.}
+\texttt{carla\_executor} is a logical step executor today; CARLA proves sensor and spawn integration.
+Map server (:8100) is optional for navigation LLM only.
+
+\section{Initial Results and Observations}
+We ran 50 generated scenarios locally with three policies (Table~\ref{tab:results}).
+Results are an \textbf{integration checkpoint} for the visual policy loop; the multi-agent graph is validated separately via pytest and curated demos (\texttt{demo\_01} safe pass, \texttt{demo\_02} oncoming rejected).
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{lrrrr}
+\toprule
+Policy & Failures & Avg.\ time (s) & Pass att. & Unsafe pass \\
+\midrule
+No-pass & 16/50 & 96.58 & 0 & 0 \\
+AutoPass & 13/50 & 90.16 & 19 & 0 \\
+Aggressive & 41/50 & 60.08 & 154 & 134 \\
+\bottomrule
+\end{tabular}
+\caption{Visual closed-loop prototype: AutoPass trades delay for safety versus baselines.}
+\label{tab:results}
+\vspace{-6pt}
+\end{table}
+
+\textbf{Qualitative:} AutoPass reduces conservative-delay failures (16$\rightarrow$11) with zero unsafe passes; aggressive minimizes time but collides often in unsafe gaps.
+\textbf{Engineering fixes exposed by traces:} lane-aware collision checks, car-following on \texttt{wait}, and CARLA multi-agent watch kinematics aligned with \texttt{advance\_world\_step} to prevent lead--ego overlap in videos.
+
+\textbf{Automated tests:} 16 pytest cases cover perception extraction, safety gates, and graph smoke paths---giving reviewers a reproducible progress signal beyond demo videos.
+
+\section{Expected Outcomes and Scope}
+By the final report we target: (1)~executable multi-agent passing graph with readable traces; (2)~vision-grounded distance extraction on curated and CARLA frames; (3)~quantitative comparison of AutoPass vs.\ baselines; (4)~failure taxonomy (unsafe pass, missed safe pass, delay, collision); (5)~short CARLA recordings tied to scenario IDs.
+
+\textbf{Next steps:} wire executor to CARLA vehicle control; add deterministic A* replan verification on the city map graph; run full multi-agent batch metrics on six curated scenarios.
+
+\section{Method and Implementation Details}
+\textbf{LangGraph orchestration.} Nodes mirror Fig.~\ref{fig:pipeline}; conditional edges route to the passing subgraph when \texttt{passing\_available}, to traffic/replan tiers on \texttt{move\_but\_not\_pass}, and back to \texttt{carla\_executor} until \texttt{arrived}.
+
+\textbf{Navigate modes.} Mode~1: empty plan $\rightarrow$ LLM route from map + request. Mode~2: \texttt{passing\_signal} $\rightarrow$ passing instructions + route update. Mode~3: drive, periodic depth burst, set \texttt{passing\_available} when a slow lead is detected.
+
+\textbf{Current-lane physics (code).} With front distance $d_f$, car length $L$, hazard distance $d_h$, buffer $\Delta=20$\,m: pass distance $d_f+L$, available $d_h-\Delta$, required time from LLM target speed vs.\ ego/lead speeds; cap 5\,s pass window.
+
+\textbf{Presentation guidance (from course feedback).} Lead with problem--hypothesis--demo evidence; show one scenario panel and 4--6 lines of trace; label each image (RGB vs.\ seg vs.\ depth); state explicitly which nodes are code vs.\ LLM; separate navigation map server from CARLA simulator.
+
+{\small
+\vspace{-4pt}
+\bibliographystyle{ieeenat_fullname}
+\bibliography{refs}
+}
+
+\end{document}

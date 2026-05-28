@@ -19,12 +19,12 @@ def _bootstrap_carla():
     global _carla
     if _carla is not None:
         return _carla
-    egg = os.environ.get(
-        "CARLA_EGG",
-        r"C:\carla\PythonAPI\carla\dist\carla-0.9.15-py3.7-win-amd64.egg",
-    )
-    if egg and os.path.isfile(egg) and egg not in sys.path:
-        sys.path.insert(0, egg)
+    # egg = os.environ.get(
+    #     "CARLA_EGG",
+    #     r"C:\carla\PythonAPI\carla\dist\carla-0.9.15-py3.7-win-amd64.egg",
+    # )
+    # if egg and os.path.isfile(egg) and egg not in sys.path:
+    #     sys.path.insert(0, egg)
     import carla as carla_mod
 
     _carla = carla_mod

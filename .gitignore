@@ -28,8 +28,10 @@ src/*.egg-info/
 # Generated experiment outputs
 runs/
 outputs/
+.autopass/
 logs/
 artifacts/
+presentation/
 
 # Keep a placeholder for folder structure in Git
 !runs/.gitkeep

@@ -24,20 +24,53 @@ CAMERA_FOCAL_PX = CAMERA_WIDTH_PX / (2 * np.tan(np.radians(CAMERA_FOV_DEG / 2)))
 def _acquire_frame(spec: ScenarioSpec, world: WorldState) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     ctx = get_context()
     if ctx.backend == "carla":
+        from autopass.config import AutopassConfigurationError, is_test_mode
         try:
-            from perception.carla_bridge import grab_carla_frame
+            from perception.carla_scenario import acquire_carla_frame
 
-            frame = grab_carla_frame()
+            frame = acquire_carla_frame(spec, world)
             if frame is not None:
                 return frame
-        except Exception:
-            pass
+            if not is_test_mode():
+                from perception.carla_scenario import get_session
+
+                diag = ""
+                try:
+                    diag = get_session().sensor_frame_diagnostic()
+                except Exception:
+                    pass
+                raise AutopassConfigurationError(
+                    "CARLA backend active but no frame from simulator. "
+                    "Refusing synthetic fallback in production mode.\n  "
+                    + diag
+                )
+            print("[CARLA] No frame from simulator — falling back to synthetic visual_world in test mode.")
+        except Exception as e:
+            if not is_test_mode():
+                raise
+            print(f"[CARLA] Error: {e} — falling back to synthetic visual_world in test mode.")
     return render_sensor_frame(spec, world)[:3]
 
 
 def run_segmentation(rgb_image: np.ndarray) -> dict:
     """Instance segmentation from semantic mask pixels (not random mock data)."""
     ctx = get_context()
+    if ctx.backend == "carla" and ctx.spec is not None and ctx.world is not None:
+        rgb, seg, depth_m = _acquire_frame(ctx.spec, ctx.world)
+        from perception.carla_labels import carla_seg_to_car_distances
+
+        car_masks = []
+        for c in carla_seg_to_car_distances(seg, depth_m):
+            x0, y0, x1, y1 = c["bbox"]
+            m = np.zeros(seg.shape, dtype=np.uint8)
+            m[y0 : y1 + 1, x0 : x1 + 1] = 1
+            car_masks.append({"bbox": c["bbox"], "mask": m, "confidence": 0.9, "label": "car"})
+        return {
+            "car_masks": car_masks,
+            "lane_lines": [],
+            "hazards": [],
+            "drivable_area": np.isin(seg, [7, 8]).astype(np.uint8),
+        }
     if ctx.spec is not None and ctx.world is not None:
         _, seg, _ = _acquire_frame(ctx.spec, ctx.world)
         return extract_segmentation_from_frame(seg, rgb_image if rgb_image is not None else np.zeros_like(seg[..., None].repeat(3, 2)))
@@ -48,6 +81,12 @@ def run_segmentation(rgb_image: np.ndarray) -> dict:
 def run_depth_estimation(rgb_image: np.ndarray) -> dict:
     """Metric depth from depth map pixels (median per instance region)."""
     ctx = get_context()
+    if ctx.backend == "carla" and ctx.spec is not None and ctx.world is not None:
+        rgb, seg, depth_m = _acquire_frame(ctx.spec, ctx.world)
+        from perception.carla_labels import carla_frame_to_perception
+
+        _, _, depth_result = carla_frame_to_perception(rgb, seg, depth_m)
+        return depth_result
     if ctx.spec is not None and ctx.world is not None:
         _, seg, depth = _acquire_frame(ctx.spec, ctx.world)
         return extract_depth_from_frame(seg, depth)
@@ -130,7 +169,7 @@ def capture_multi_frame_perception(
         slope, _ = np.polyfit(times, depths, 1)
         front_car_speed = max(0.0, base_world.ego_speed_mps + slope)
     else:
-        front_car_speed = max(0.0, spec.lead.speed_mps)
+        front_car_speed = None
 
     CAR_LENGTH_TO_WIDTH_RATIO = 2.0
     valid_lengths = []
@@ -147,14 +186,14 @@ def capture_multi_frame_perception(
         slope_r, _ = np.polyfit(times_r, depths_r, 1)
         back_car_closing_rate = -float(slope_r)
     else:
-        back_car_closing_rate = max(0.0, spec.rear.speed_mps - base_world.ego_speed_mps)
+        back_car_closing_rate = None
 
     return {
         "depth_result": last_depth_result,
         "seg_result": last_seg_result,
-        "front_car_speed": round(front_car_speed, 1),
+        "front_car_speed": round(front_car_speed, 1) if front_car_speed is not None else None,
         "front_car_length": round(front_car_length, 1),
-        "back_car_closing_rate": round(back_car_closing_rate, 1),
+        "back_car_closing_rate": round(back_car_closing_rate, 1) if back_car_closing_rate is not None else None,
         "hazard_detected": any_hazard,
         "num_frames": num_frames,
         "lane_density_cars_per_100m": _lane_density(last_seg_result, last_depth_result),

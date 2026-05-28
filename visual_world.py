@@ -88,6 +88,26 @@ def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
 
+def spec_to_dict(spec: ScenarioSpec) -> dict:
+    from dataclasses import asdict
+    return asdict(spec)
+
+
+def dict_to_spec(d: dict) -> ScenarioSpec:
+    return ScenarioSpec(
+        scenario_id=d["scenario_id"],
+        route=RouteSpec(**d["route"]),
+        request=RequestSpec(**d["request"]),
+        ego_speed_mps=d["ego_speed_mps"],
+        lead=VehicleSpec(**d["lead"]),
+        rear=VehicleSpec(**d["rear"]),
+        oncoming=VehicleSpec(**d["oncoming"]),
+        occlusion=OcclusionSpec(**d["occlusion"]),
+        weather=WeatherSpec(**d["weather"]),
+        sensor=SensorSpec(**d["sensor"]),
+    )
+
+
 def initialize_world(spec: ScenarioSpec) -> WorldState:
     return WorldState(
         ego_x_m=spec.route.start_x_m,
@@ -96,6 +116,64 @@ def initialize_world(spec: ScenarioSpec) -> WorldState:
         lead_x_m=spec.route.start_x_m + spec.lead.distance_m,
         rear_x_m=spec.route.start_x_m - spec.rear.distance_m,
         oncoming_x_m=spec.route.start_x_m + spec.oncoming.distance_m,
+    )
+
+
+def advance_world_step(
+    spec: ScenarioSpec,
+    world: WorldState,
+    action: str = "wait",
+    dt: float = 1.0,
+) -> WorldState:
+    """One kinematic step (shared by visual LangGraph loop and CARLA watch demos)."""
+    lead_x = world.lead_x_m + spec.lead.speed_mps * dt + 0.5 * spec.lead.accel_mps2 * dt * dt
+    rear_x = world.rear_x_m + spec.rear.speed_mps * dt
+    oncoming_x = world.oncoming_x_m - spec.oncoming.speed_mps * dt
+
+    if action == "pass":
+        ego_lane = 1
+        ego_speed = min(spec.route.speed_limit_mps + 2.0, world.ego_speed_mps + 1.35)
+    elif action == "replan":
+        ego_lane = 0
+        front = max(0.0, world.lead_x_m - world.ego_x_m)
+        target = spec.lead.speed_mps + (1.0 if front > 22.0 else 0.0)
+        ego_speed = max(4.5, min(world.ego_speed_mps, target))
+    else:
+        ego_lane = 0
+        front = max(0.0, world.lead_x_m - world.ego_x_m)
+        target = spec.lead.speed_mps if front < 22.0 else min(world.ego_speed_mps, spec.route.speed_limit_mps)
+        ego_speed = max(0.0, min(world.ego_speed_mps + 0.4, target))
+
+    ego_x = world.ego_x_m + ego_speed * dt
+    passed = world.passed or ego_x > lead_x + 9.0
+    if passed:
+        ego_lane = 0
+        ego_speed = min(spec.route.speed_limit_mps, ego_speed)
+        # Keep lead behind ego in 1D layout so CARLA does not place it on top of ego
+        lead_x = min(lead_x, ego_x - 12.0)
+
+    collision = False
+    if not passed and ego_lane == 0 and abs(ego_x - lead_x) < 4.0:
+        collision = True
+    if ego_lane == 0 and (ego_x - rear_x) < 4.0:
+        collision = True
+    if ego_lane == 1 and abs(ego_x - oncoming_x) < 6.0:
+        collision = True
+    if ego_lane == 1 and abs(ego_x - rear_x) < 5.0:
+        collision = True
+
+    done = collision or ego_x >= spec.route.goal_x_m or world.t_s + dt >= 160.0
+    return WorldState(
+        t_s=world.t_s + dt,
+        ego_x_m=ego_x,
+        ego_lane=ego_lane,
+        ego_speed_mps=ego_speed,
+        lead_x_m=lead_x,
+        rear_x_m=rear_x,
+        oncoming_x_m=oncoming_x,
+        passed=passed,
+        collision=collision,
+        done=done,
     )
 
 
@@ -274,12 +352,17 @@ def extract_depth_from_frame(seg: np.ndarray, depth: np.ndarray) -> Dict:
         if np.sum(seg == label) == 0:
             continue
         d = _median_depth_for_label(seg, depth, label, 999.0)
-        cy = int(np.where(seg == label)[0].mean())
+        ys_lbl = np.where(seg == label)[0]
+        xs_lbl = np.where(seg == label)[1]
+        cy = float(ys_lbl.mean())
+        cx = float(xs_lbl.mean())
         car_distances.append({
             "bbox": bbox_for_label(seg, label),
             "median_depth": round(d, 2),
             "min_depth": round(d * 0.92, 2),
-            "position": label_to_car_position(label, cy, h),
+            "position": label_to_car_position(label, int(cy), h),
+            "cy_mean": cy,
+            "cx_mean": cx,
         })
     finite = depth[np.isfinite(depth)]
     return {

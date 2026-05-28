@@ -51,27 +51,12 @@ def test_target_velocity_llm_respects_highway_cap():
 
 @pytest.mark.skipif(importlib.util.find_spec("langgraph") is None, reason="langgraph not installed")
 def test_multi_agent_graph_runs_with_visual_context():
-    from langgraph.checkpoint.memory import MemorySaver
-    from agents.autopassing import build_autopassing_graph
+    from autopass.graph import run_agentic_episode
 
     spec = curated_demo_scenarios()[0]
     world = initialize_world(spec)
     set_context(spec, world, "visual")
-    app = build_autopassing_graph(checkpointer=MemorySaver())
-    state = {
-        "travel_request": "Take me from downtown to the airport, I'm in a hurry",
-        "starting_point": "Downtown Mall",
-        "goal": "Airport",
-        "aggressive_level": "high",
-        "original_aggressive_level": "high",
-        "navigation_plan": [],
-        "passing_signal": "",
-        "passing_instructions": {"overtake_maneuver": [], "merge_back_maneuver": []},
-        "visual_scenario": {"spec": asdict(spec), "world": asdict(world), "backend": "visual"},
-        "messages": [],
-    }
-    with patch("agents.autopassing.pull_map_from_server", return_value={"city": "SimCity", "streets": [], "landmarks": []}):
-        with patch("agents.autopassing.random.random", return_value=0.1):
-            result = app.invoke(state, config={"configurable": {"thread_id": "test-integrated"}})
-    assert result.get("navigation_plan")
-    assert len(result.get("messages", [])) > 0
+    result = run_agentic_episode(spec, policy="autopass", perception_backend="visual", max_drive_steps=20, skip_runtime_check=True)
+    assert result.get("dsl")
+    assert len(result["dsl"].get("perception_log", [])) >= 1
+    assert result.get("metrics")
