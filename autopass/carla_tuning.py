@@ -19,12 +19,12 @@ def corridor_merge_horizon_m() -> float:
     return _f("CORRIDOR_MERGE_HORIZON_M", 22.0)
 
 
-def lane_change_lateral_mult() -> float:
-    return _f("LANE_CHANGE_LATERAL_MULT", 2.8)
-
-
 def lane_change_steer_cap_mult() -> float:
-    return _f("LANE_CHANGE_STEER_CAP_MULT", 1.7)
+    return _f("LANE_CHANGE_STEER_CAP_MULT", 1.45)
+
+
+def lane_change_lateral_mult() -> float:
+    return _f("LANE_CHANGE_LATERAL_MULT", 2.4)
 
 
 def _f(name: str, default: float) -> float:
@@ -51,7 +51,7 @@ def pass_lateral_min_m() -> float:
 
 def max_steer() -> float:
     """Steering magnitude cap (CARLA VehicleControl.steer in [-1, 1])."""
-    return _f("MAX_STEER", 0.18)
+    return _f("MAX_STEER", 0.15)
 
 
 def steer_gain() -> float:

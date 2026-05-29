@@ -5,6 +5,7 @@ import os
 from typing import List
 
 from perception.carla_geometry import actor_debug_record, actor_location_tuple, euclidean_m
+from perception.pass_geometry import pass_geometry_exempt
 
 MIN_ACTOR_SEPARATION_M = 3.5
 MIN_LEAD_GAP_M = 2.5
@@ -27,10 +28,12 @@ def _validate_carla_actors(session) -> List[str]:
         if ego_wp.lane_type != session.carla.LaneType.Driving:
             issues.append("ego_not_on_driving_lane")
         off = euclidean_m(ego_loc, ego_wp.transform.location)
-        if not getattr(session, "_lane_departure_stopped", False) and off > 3.5:
+        if not getattr(session, "_lane_departure_stopped", False) and off > 3.5 and not exempt:
             issues.append(f"ego_off_lane_center: {off:.1f}m from lane center")
     except Exception:
         pass
+
+    exempt = pass_geometry_exempt(session)
 
     for name in ("lead", "rear", "oncoming"):
         actor = session.actors.get(name)
@@ -65,7 +68,7 @@ def _validate_carla_actors(session) -> List[str]:
                 issues.append(f"{name}_on_opposing_lane: {d:.1f}m from ego [{lane_dbg}]")
 
         if name == "rear":
-            if hasattr(session, "ego_convoy_misaligned") and session.ego_convoy_misaligned():
+            if exempt or (hasattr(session, "ego_convoy_misaligned") and session.ego_convoy_misaligned()):
                 continue
             rear_signed = session.signed_gap_from_ego("rear") if hasattr(session, "signed_gap_from_ego") else None
             rear_gap = None if rear_signed is None else max(0.0, -float(rear_signed))
@@ -76,7 +79,7 @@ def _validate_carla_actors(session) -> List[str]:
             continue
 
         if name == "lead":
-            if hasattr(session, "ego_convoy_misaligned") and session.ego_convoy_misaligned():
+            if exempt or (hasattr(session, "ego_convoy_misaligned") and session.ego_convoy_misaligned()):
                 continue
             lead_signed = session.signed_gap_from_ego("lead") if hasattr(session, "signed_gap_from_ego") else None
             lead_gap = None if lead_signed is None else max(0.0, float(lead_signed))

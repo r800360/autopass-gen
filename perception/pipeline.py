@@ -52,6 +52,27 @@ def _acquire_frame(spec: ScenarioSpec, world: WorldState) -> Tuple[np.ndarray, n
     return render_sensor_frame(spec, world)[:3]
 
 
+def _depth_result_from_frame(
+    rgb: np.ndarray, seg: np.ndarray, depth: np.ndarray, *, backend: str
+) -> dict:
+    if backend == "carla":
+        from perception.carla_labels import carla_frame_to_perception
+
+        _, _, depth_result = carla_frame_to_perception(rgb, seg, depth)
+        return depth_result
+    return extract_depth_from_frame(seg, depth)
+
+
+def _carla_burst_context() -> Dict[str, object]:
+    from perception.carla_scenario import get_session
+    from perception.passing_topology import passing_lane_topology
+
+    session = get_session()
+    if not session.ready:
+        return {}
+    return passing_lane_topology(session)
+
+
 def run_segmentation(rgb_image: np.ndarray) -> dict:
     """Instance segmentation from semantic mask pixels (not random mock data)."""
     ctx = get_context()
@@ -83,13 +104,10 @@ def run_depth_estimation(rgb_image: np.ndarray) -> dict:
     ctx = get_context()
     if ctx.backend == "carla" and ctx.spec is not None and ctx.world is not None:
         rgb, seg, depth_m = _acquire_frame(ctx.spec, ctx.world)
-        from perception.carla_labels import carla_frame_to_perception
-
-        _, _, depth_result = carla_frame_to_perception(rgb, seg, depth_m)
-        return depth_result
+        return _depth_result_from_frame(rgb, seg, depth_m, backend="carla")
     if ctx.spec is not None and ctx.world is not None:
-        _, seg, depth = _acquire_frame(ctx.spec, ctx.world)
-        return extract_depth_from_frame(seg, depth)
+        rgb, seg, depth = _acquire_frame(ctx.spec, ctx.world)
+        return _depth_result_from_frame(rgb, seg, depth, backend="visual")
     h, w = (rgb_image.shape[:2] if rgb_image is not None else (720, 1280))
     depth_map = np.full((h, w), 100.0, dtype=np.float32)
     return {"depth_map": depth_map, "min_depth": 5.0, "max_depth": 200.0, "car_distances": []}
@@ -117,49 +135,75 @@ def capture_multi_frame_perception(
         }
 
     spec, base_world = ctx.spec, ctx.world
+    backend = ctx.backend or "visual"
+    carla_ctx = _carla_burst_context() if backend == "carla" else {}
     front_depths = []
     rear_depths = []
     front_bboxes = []
     any_hazard = False
     last_depth_result = None
     last_seg_result = None
+    image_width = float(image_shape[1])
+    image_height = float(image_shape[0])
+    session = None
+    last_lead_meta: Dict[str, object] = {}
+    if backend == "carla":
+        from perception.carla_scenario import get_session
+
+        session = get_session()
 
     for i in range(num_frames):
-        world = WorldState(
-            t_s=base_world.t_s + i * interval_s,
-            ego_x_m=base_world.ego_x_m + base_world.ego_speed_mps * i * interval_s * 0.15,
-            ego_lane=base_world.ego_lane,
-            ego_speed_mps=base_world.ego_speed_mps,
-            lead_x_m=base_world.lead_x_m + spec.lead.speed_mps * i * interval_s * 0.15,
-            rear_x_m=base_world.rear_x_m + spec.rear.speed_mps * i * interval_s * 0.1,
-            oncoming_x_m=base_world.oncoming_x_m - spec.oncoming.speed_mps * i * interval_s * 0.1,
-            passed=base_world.passed,
-            collision=base_world.collision,
-            done=base_world.done,
-        )
-        rgb, seg, depth = _acquire_frame(spec, world)
-        last_depth_result = extract_depth_from_frame(seg, depth)
+        if backend == "carla" and session is not None and session.ready:
+            session.advance_perception_burst_frame(spec, interval_s)
+
+        rgb, seg, depth = _acquire_frame(spec, base_world)
+        h, w = seg.shape[:2]
+        image_width, image_height = float(w), float(h)
+        last_depth_result = _depth_result_from_frame(rgb, seg, depth, backend=backend)
         last_seg_result = extract_segmentation_from_frame(seg, rgb)
 
-        front_cars = [c for c in last_depth_result["car_distances"] if c["position"] == "front"]
+        from autopass.perception_state import classify_car_distances
+
+        _, classified = classify_car_distances(
+            last_depth_result.get("car_distances", []),
+            image_width=image_width,
+            image_height=image_height,
+        )
+        if backend == "carla" and session is not None and session.ready:
+            try:
+                from perception.carla_actor_association import apply_carla_detection_belief
+
+                classified, _, lead_meta = apply_carla_detection_belief(session, classified)
+                if lead_meta:
+                    last_lead_meta = lead_meta
+            except Exception:
+                pass
+        else:
+            try:
+                from autopass.perception_state import finalize_front_lead_detection
+
+                classified = finalize_front_lead_detection(classified)
+            except Exception:
+                pass
+        front_cars = [c for c in classified if c.get("used_for_front_gap")]
         if front_cars:
-            closest = min(front_cars, key=lambda c: c["median_depth"])
-            front_depths.append(closest["median_depth"])
+            closest = min(front_cars, key=lambda c: c.get("depth_m", c.get("median_depth", 999.0)))
+            front_depths.append(float(closest.get("depth_m", closest.get("median_depth", 999.0))))
             bbox = closest["bbox"]
-            front_bboxes.append((bbox[2] - bbox[0], closest["median_depth"]))
+            front_bboxes.append((bbox[2] - bbox[0], front_depths[-1]))
         else:
             front_depths.append(None)
 
-        rear_cars = [c for c in last_depth_result["car_distances"] if c["position"].startswith("rear")]
+        rear_cars = [c for c in classified if str(c.get("position", "")).startswith("rear")]
         if rear_cars:
-            closest_rear = min(rear_cars, key=lambda c: c["median_depth"])
-            rear_depths.append(closest_rear["median_depth"])
+            closest_rear = min(rear_cars, key=lambda c: c.get("depth_m", c.get("median_depth", 999.0)))
+            rear_depths.append(float(closest_rear.get("depth_m", closest_rear.get("median_depth", 999.0))))
         else:
             rear_depths.append(None)
 
         if last_seg_result["hazards"]:
             any_hazard = True
-        if i < num_frames - 1:
+        if i < num_frames - 1 and backend != "carla":
             time.sleep(min(interval_s, 0.05))
 
     valid_front = [(i, d) for i, d in enumerate(front_depths) if d is not None]
@@ -167,7 +211,11 @@ def capture_multi_frame_perception(
         times = np.array([v[0] * interval_s for v in valid_front])
         depths = np.array([v[1] for v in valid_front])
         slope, _ = np.polyfit(times, depths, 1)
-        front_car_speed = max(0.0, base_world.ego_speed_mps + slope)
+        if backend == "carla":
+            # Ego held still during burst; depth slope ≈ lead speed when lead moves ahead.
+            front_car_speed = max(0.0, float(slope))
+        else:
+            front_car_speed = max(0.0, base_world.ego_speed_mps + slope)
     else:
         front_car_speed = None
 
@@ -188,7 +236,7 @@ def capture_multi_frame_perception(
     else:
         back_car_closing_rate = None
 
-    return {
+    out = {
         "depth_result": last_depth_result,
         "seg_result": last_seg_result,
         "front_car_speed": round(front_car_speed, 1) if front_car_speed is not None else None,
@@ -197,10 +245,42 @@ def capture_multi_frame_perception(
         "hazard_detected": any_hazard,
         "num_frames": num_frames,
         "lane_density_cars_per_100m": _lane_density(last_seg_result, last_depth_result),
+        "image_width": image_width,
+        "image_height": image_height,
     }
+    out.update(carla_ctx)
+    if last_lead_meta:
+        out["lead_resolution"] = last_lead_meta
+    if backend == "carla":
+        from perception.carla_scenario import get_session
+
+        session = get_session()
+        if (
+            session.ready
+            and spec is not None
+            and session.allows_pre_decision_actor_layout()
+        ):
+            session.restore_lead_spawn_longitudinal_gap(spec)
+        if session.ready and last_depth_result is not None:
+            try:
+                from autopass.perception_state import classify_car_distances
+                from perception.carla_actor_association import apply_carla_detection_belief
+
+                _, classified = classify_car_distances(
+                    last_depth_result.get("car_distances", []),
+                    image_width=image_width,
+                    image_height=image_height,
+                )
+                classified, _, _ = apply_carla_detection_belief(session, classified)
+                last_depth_result = dict(last_depth_result)
+                last_depth_result["car_distances"] = classified
+                out["depth_result"] = last_depth_result
+            except Exception:
+                pass
+    return out
 
 
 def _lane_density(seg_result: dict, depth_result: dict) -> float:
-  """Cars in passing lane within 100m — used by traffic-check tool."""
-  cars = [c for c in depth_result.get("car_distances", []) if c["median_depth"] < 100]
-  return len(cars) * 4.5 / max(1.0, 100.0)
+    """Cars in passing lane within 100m — used by traffic-check tool."""
+    cars = [c for c in depth_result.get("car_distances", []) if c["median_depth"] < 100]
+    return len(cars) * 4.5 / max(1.0, 100.0)

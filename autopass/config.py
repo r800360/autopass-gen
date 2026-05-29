@@ -38,16 +38,29 @@ def control_mode() -> str:
     return os.environ.get("AUTOPASS_CONTROL_MODE", "vehicle")
 
 
+def llm_temperature() -> float:
+    """Production planner/judgment temperature (>0 for non-deterministic agency)."""
+    if is_test_mode():
+        return 0.0
+    try:
+        return float(os.environ.get("AUTOPASS_LLM_TEMPERATURE", "0.4"))
+    except ValueError:
+        return 0.4
+
+
 def apply_production_defaults() -> None:
     """Production: real LLM + CARLA perception + vehicle physics."""
     if is_test_mode():
         os.environ.setdefault("AUTOPASS_MOCK_LLM", "1")
         os.environ.setdefault("AUTOPASS_PERCEPTION_BACKEND", "visual")
         os.environ.setdefault("AUTOPASS_CONTROL_MODE", "kinematic")
+        os.environ.setdefault("AUTOPASS_DECISION_ORACLE", "1")
         return
     os.environ["AUTOPASS_MOCK_LLM"] = os.environ.get("AUTOPASS_MOCK_LLM", "0")
     os.environ["AUTOPASS_PERCEPTION_BACKEND"] = os.environ.get("AUTOPASS_PERCEPTION_BACKEND", "carla")
     os.environ["AUTOPASS_CONTROL_MODE"] = os.environ.get("AUTOPASS_CONTROL_MODE", "vehicle")
+    os.environ.setdefault("AUTOPASS_DECISION_ORACLE", "0")
+    os.environ.setdefault("AUTOPASS_LLM_TEMPERATURE", "0.4")
 
 
 def require_openai() -> None:
@@ -84,9 +97,10 @@ def require_carla_server() -> None:
 
     host = os.environ.get("CARLA_HOST", "127.0.0.1")
     port = int(os.environ.get("CARLA_PORT", "2000"))
+    timeout_s = float(os.environ.get("CARLA_CONNECT_TIMEOUT", "30"))
     try:
         client = carla.Client(host, port)
-        client.set_timeout(8.0)
+        client.set_timeout(timeout_s)
         ver = client.get_server_version()
         if not ver:
             raise RuntimeError("empty server version")
@@ -121,6 +135,15 @@ def allow_unvalidated_carla_environments() -> bool:
 def hero_corridor_enabled() -> bool:
     """When true, accept hero-validated corridors for demo/benchmark video."""
     return os.environ.get("AUTOPASS_CARLA_HERO_CORRIDOR", "0").strip() in ("1", "true", "True")
+
+
+def decision_oracle_enabled() -> bool:
+    """When false, CARLA belief must not use actor-axis gap fallbacks (honest vision-only decisions)."""
+    if is_test_mode():
+        default = "1"
+    else:
+        default = "0"
+    return os.environ.get("AUTOPASS_DECISION_ORACLE", default).strip() in ("1", "true", "True")
 
 
 def corridor_validation_mode() -> str:

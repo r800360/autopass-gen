@@ -44,21 +44,55 @@ def _speed_mps(velocity) -> float:
     return math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
 
 
+def _near_miss_this_step(
+    session,
+    min_front: float,
+    *,
+    collision: bool,
+    pass_st,
+    ego_lane: int,
+    requested_action: str,
+) -> bool:
+    """Near-miss uses longitudinal corridor gap during lateral pass (not Euclidean)."""
+    if collision:
+        return False
+    threshold = near_miss_m()
+    if requested_action == "pass" or getattr(pass_st, "active", False):
+        lead = session.actors.get("lead") if getattr(session, "ready", False) else None
+        if lead is not None and hasattr(session, "_longitudinal_along_travel"):
+            along = session._longitudinal_along_travel(lead)
+            if along is not None:
+                if along <= 0:
+                    return False
+                if ego_lane == 1 or getattr(pass_st, "phase", "") in ("lane_change", "overtake", "merge_back"):
+                    return along < threshold
+    return min_front < threshold
+
+
 def resolve_pass_phase(
     action: str,
     *,
     ego_lane: int,
     clear_of_lead: bool,
     front_gap_m: float,
+    pass_fsm_phase: str | None = None,
 ) -> PassPhase:
     if action != "pass":
+        return "cruise"
+    if pass_fsm_phase == "merge_back":
+        return "merge"
+    if pass_fsm_phase == "overtake":
+        return "overtake"
+    if pass_fsm_phase in ("prepare_pass", "lane_change"):
+        return "lane_change"
+    if pass_fsm_phase == "abort":
         return "cruise"
     if clear_of_lead:
         return "merge"
     if ego_lane == 1:
         return "overtake"
     if front_gap_m < pass_lateral_min_m():
-        return "approach"
+        return "lane_change"
     return "lane_change"
 
 
@@ -72,12 +106,19 @@ def acc_speed_target(
     speed_limit_mps: float,
     phase: PassPhase,
     longitudinal_lead_gap_m: float | None = None,
+    pass_fsm_phase: str | None = None,
+    pass_maneuver_started: bool = False,
 ) -> float:
     """Adaptive cruise: cap speed when closing on lead in travel lane."""
     target = target_speed_mps if target_speed_mps > 0 else current_speed_mps
 
     if action == "pass":
-        target = min(speed_limit_mps + 1.5, max(target, current_speed_mps + 1.0))
+        if pass_fsm_phase == "prepare_pass" and not pass_maneuver_started:
+            target = min(target, lead_speed_mps + 1.0, speed_limit_mps * 0.45, max(4.5, current_speed_mps))
+        elif pass_fsm_phase == "lane_change" and not pass_maneuver_started:
+            target = min(target, max(lead_speed_mps + 1.5, 5.0), speed_limit_mps * 0.52, max(5.0, current_speed_mps * 0.95))
+        else:
+            target = min(speed_limit_mps + 1.5, max(target, current_speed_mps + 1.0))
     elif action == "replan":
         target = max(4.0, lead_speed_mps)
     else:
@@ -85,8 +126,8 @@ def acc_speed_target(
         if front_gap_m < safe_follow_m() + 6.0:
             target = min(target, lead_speed_mps + 0.5)
 
-    # Beside lead during pass: 3D gap ~lane width is not in-path.
-    if phase in ("overtake", "lane_change"):
+    # Beside lead during pass: 3D gap ~lane width is not in-path — only after lateral commit.
+    if phase in ("overtake", "lane_change") and pass_maneuver_started:
         along = (
             longitudinal_lead_gap_m
             if longitudinal_lead_gap_m is not None
@@ -135,9 +176,19 @@ def speed_to_throttle_brake(
     return throttle, brake
 
 
-def _target_driving_waypoint(session, ego, phase: PassPhase, passing_side: str):
+def _target_driving_waypoint(
+    session,
+    ego,
+    phase: PassPhase,
+    passing_side: str,
+    *,
+    action_semantic: str = "",
+):
+    if action_semantic == "follow_lead" and hasattr(session, "get_travel_steering_waypoint"):
+        return session.get_travel_steering_waypoint(ego)
     if hasattr(session, "get_steering_waypoint"):
-        return session.get_steering_waypoint(ego, phase, passing_side)
+        steer_phase = "cruise" if action_semantic == "follow_lead" else phase
+        return session.get_steering_waypoint(ego, steer_phase, passing_side)
     carla = session.carla
     wp = session.map.get_waypoint(
         ego.get_location(), project_to_road=True, lane_type=carla.LaneType.Driving
@@ -203,6 +254,8 @@ def build_vehicle_control(
     ego_lane: int | None = None,
     recovery: bool = False,
     scripted_phase: str | None = None,
+    pass_fsm_phase: str | None = None,
+    pass_maneuver_started: bool = False,
 ) -> Any:
     import carla
 
@@ -220,10 +273,18 @@ def build_vehicle_control(
     phase = (
         "cruise"
         if action_semantic == "follow_lead"
-        else resolve_pass_phase(action, ego_lane=lane, clear_of_lead=clear_of_lead, front_gap_m=front)
+        else resolve_pass_phase(
+            action,
+            ego_lane=lane,
+            clear_of_lead=clear_of_lead,
+            front_gap_m=front,
+            pass_fsm_phase=pass_fsm_phase,
+        )
     )
     if scripted_phase == "merge_back" and not clear_of_lead:
         phase = "overtake"
+    if pass_fsm_phase == "prepare_pass" and not pass_maneuver_started:
+        phase = "lane_change"
 
     lead_speed_for_acc = world.ego_speed_mps
     if session is not None and hasattr(session, "actors"):
@@ -243,10 +304,22 @@ def build_vehicle_control(
         speed_limit_mps=spec.route.speed_limit_mps,
         phase=phase,
         longitudinal_lead_gap_m=lead_along,
+        pass_fsm_phase=pass_fsm_phase,
+        pass_maneuver_started=pass_maneuver_started,
     )
 
     if recovery:
         target = min(target, max(2.5, current * 0.65))
+
+    fsm_scripted = None
+    if pass_fsm_phase in ("prepare_pass", "lane_change"):
+        fsm_scripted = "lane_change"
+    elif pass_fsm_phase == "overtake":
+        fsm_scripted = "overtake"
+    elif pass_fsm_phase == "merge_back":
+        fsm_scripted = "merge_back"
+    if scripted_phase is None and fsm_scripted is not None:
+        scripted_phase = fsm_scripted
 
     steer_kw: dict = {}
     no_steer_penalty = False
@@ -259,44 +332,97 @@ def build_vehicle_control(
                 shift = float(session.lateral_shift_toward_passing_m(ego))
             if hasattr(session, "expected_passing_lane_width_m"):
                 width = float(session.expected_passing_lane_width_m())
-        # Finish most lateral motion before full pass speed (avoids wide highway arcs).
-        if shift < 0.55 * width:
-            target = min(target, 6.5)
-        else:
-            target = max(target, 7.0)
+        progress = min(1.0, max(0.0, shift / max(2.5, width)))
+        # Gradual lateral commit — avoid overshooting into oncoming shoulder.
+        target = min(target, 5.5 + 2.5 * progress)
         steer_kw = {
-            "max_steer_override": min(0.32, max_steer() * min(cap_mult, 1.5)),
-            "lateral_gain_mult": 1.1,
-            "lookahead_mult": 0.55,
-            "smooth_mult": 0.5,
+            "max_steer_override": min(0.22, max_steer() * min(cap_mult, 1.35)),
+            "lateral_gain_mult": 0.85 + 0.35 * progress,
+            "lookahead_mult": 0.45 + 0.15 * progress,
+            "smooth_mult": 0.55,
+            "max_delta": 0.035,
         }
         no_steer_penalty = True
     elif scripted_phase == "merge_back":
-        target = max(target, 5.0)
-        steer_kw = {
-            "max_steer_override": min(0.35, max_steer() * 1.5),
-            "lateral_gain_mult": 2.2,
-            "lookahead_mult": 0.45,
-            "smooth_mult": 0.65,
-        }
-        no_steer_penalty = True
+        if not clear_of_lead:
+            scripted_phase = "overtake"
+            target = min(target, max(lead_speed_for_acc + 2.0, 5.0))
+            steer_kw = {"lateral_gain_mult": 0.95, "lookahead_mult": 0.7, "max_delta": 0.03}
+        else:
+            target = max(target, 5.0)
+            steer_kw = {
+                "max_steer_override": min(0.28, max_steer() * 1.35),
+                "lateral_gain_mult": 1.6,
+                "lookahead_mult": 0.45,
+                "smooth_mult": 0.65,
+            }
+            no_steer_penalty = True
     elif scripted_phase == "overtake":
-        target = max(target, spec.route.speed_limit_mps * 0.82)
-        steer_kw = {"lateral_gain_mult": 1.3, "lookahead_mult": 0.75}
+        if not clear_of_lead:
+            target = min(target, max(lead_speed_for_acc + 3.0, 6.0), spec.route.speed_limit_mps * 0.75)
+        else:
+            target = max(target, spec.route.speed_limit_mps * 0.78)
+        steer_kw = {"lateral_gain_mult": 0.95, "lookahead_mult": 0.72, "max_delta": 0.035}
 
     head_err = 0.0
     lat_err = 0.0
+    target_lane_id = None
+    travel_lane_id = None
     if session is not None and ego is not None and session.map is not None:
-        target_wp = _target_driving_waypoint(session, ego, phase, passing_side)
+        target_wp = _target_driving_waypoint(
+            session, ego, phase, passing_side, action_semantic=action_semantic
+        )
         if recovery and hasattr(session, "get_recovery_travel_waypoint"):
             target_wp = session.get_recovery_travel_waypoint(ego) or target_wp
-        if action_semantic == "follow_lead":
-            steer_kw.setdefault("lookahead_mult", 0.9)
-            steer_kw.setdefault("lateral_gain_mult", 0.9)
+        if action_semantic == "follow_lead" and session._travel_wp is not None and target_wp is not None:
+            tw = session._travel_wp
+            travel_lane_id = int(tw.lane_id)
+            target_lane_id = int(getattr(target_wp, "lane_id", travel_lane_id))
+            if target_lane_id != travel_lane_id:
+                target_wp = session.get_travel_steering_waypoint(ego)
+                target_lane_id = travel_lane_id
+            steer_kw.setdefault("lookahead_mult", 0.85)
+            steer_kw.setdefault("lateral_gain_mult", 0.85)
             steer_kw.setdefault("max_delta", 0.03)
+            steer_kw.setdefault("max_steer_override", min(0.14, max_steer()))
         steer, head_err, lat_err = _steer_to_waypoint(
             session, ego, target_wp, recovery=recovery, **steer_kw
         )
+        unstable_heading = abs(head_err) > 35.0 or abs(lat_err) > 2.8
+        if unstable_heading and session is not None and hasattr(session, "get_recovery_travel_waypoint"):
+            recovery_wp = session.get_recovery_travel_waypoint(ego)
+            if recovery_wp is not None:
+                steer, head_err, lat_err = _steer_to_waypoint(
+                    session,
+                    ego,
+                    recovery_wp,
+                    recovery=True,
+                    max_steer_override=min(0.12, max_steer()),
+                    lateral_gain_mult=1.2,
+                    lookahead_mult=0.65,
+                    smooth_mult=0.35,
+                    max_delta=0.025,
+                )
+                target = min(target, max(2.5, current * 0.55))
+        if (
+            pass_fsm_phase in ("lane_change", "overtake", "prepare_pass")
+            and (abs(head_err) > 40.0 or abs(lat_err) > 3.0)
+            and session is not None
+            and hasattr(session, "get_passing_lane_steering_waypoint")
+        ):
+            pass_wp = session.get_passing_lane_steering_waypoint(ego)
+            steer, head_err, lat_err = _steer_to_waypoint(
+                session,
+                ego,
+                pass_wp,
+                recovery=False,
+                max_steer_override=min(0.14, max_steer()),
+                lateral_gain_mult=0.75,
+                lookahead_mult=0.55,
+                smooth_mult=0.45,
+                max_delta=0.02,
+            )
+            target = min(target, max(4.5, current * 0.65))
         ctrl.steer = steer
     else:
         ctrl.steer = 0.0
@@ -309,7 +435,13 @@ def build_vehicle_control(
         no_steer_penalty=no_steer_penalty,
         phase=phase,
     )
-    if scripted_phase == "lane_change" and current < 6.5:
+    if abs(head_err) > 30.0 or abs(lat_err) > 2.5:
+        ctrl.throttle = min(ctrl.throttle, 0.18)
+        ctrl.brake = max(ctrl.brake, 0.12 if current > 4.0 else 0.0)
+    if action_semantic == "follow_lead" and (abs(head_err) > 20.0 or abs(lat_err) > 2.0):
+        ctrl.brake = min(ctrl.brake, 0.25)
+        ctrl.throttle = min(ctrl.throttle, 0.35)
+    if scripted_phase == "lane_change" and current < 6.5 and pass_maneuver_started:
         ctrl.throttle = max(ctrl.throttle, 0.42)
         ctrl.brake = min(ctrl.brake, 0.05)
     if scripted_phase == "overtake" and current < 7.0:
@@ -318,6 +450,9 @@ def build_vehicle_control(
     ctrl.throttle = max(0.0, min(0.72, ctrl.throttle))
     ctrl.brake = max(0.0, min(0.9, ctrl.brake))
     if session is not None:
+        passing_lane_id = None
+        if getattr(session, "_passing_wp", None) is not None:
+            passing_lane_id = int(session._passing_wp.lane_id)
         session._last_control_debug = {
             "action_semantic": action_semantic,
             "heading_error_deg": float(head_err),
@@ -327,6 +462,11 @@ def build_vehicle_control(
             "brake": float(ctrl.brake),
             "ego_speed_mps": float(current),
             "phase": phase,
+            "pass_fsm_phase": pass_fsm_phase,
+            "target_lane_id": target_lane_id,
+            "travel_lane_id": travel_lane_id,
+            "passing_lane_id": passing_lane_id,
+            "pass_maneuver_started": pass_maneuver_started,
         }
     return ctrl
 
@@ -365,8 +505,6 @@ def execute_vehicle_step(
             "Call bootstrap_carla_scenario() after CarlaUE4.exe is running."
         )
 
-    session.enable_ego_physics(True)
-
     ego = session.actors.get("ego")
     if ego is None:
         from autopass.config import AutopassConfigurationError, is_test_mode
@@ -376,9 +514,68 @@ def execute_vehicle_step(
             return logical, {"mode": "kinematic_fallback", "reason": "no_ego"}
         raise AutopassConfigurationError("CARLA ego vehicle missing after bootstrap.")
 
+    session.mark_closed_loop_actuation_begun()
+
     session._episode_step += 1
     episode_step = session._episode_step
     in_spawn_grace = episode_step <= 1
+
+    from perception.pass_control_fsm import (
+        get_pass_control_state,
+        pass_control_tick,
+        fsm_diagnostics,
+    )
+
+    pass_in_progress = action == "pass" or bool(getattr(session, "_pass_control", None) and get_pass_control_state(session).active)
+    requested_action = action
+    pass_st = get_pass_control_state(session)
+    pass_st, effective_action, fsm_control_failure = pass_control_tick(
+        session,
+        ego,
+        requested_action=requested_action,
+        pass_in_progress=pass_in_progress or pass_st.active,
+        front_gap_m=session.measure_actor_gaps_3d().get("front", 999.0),
+        clear_of_lead=_session_cleared_of_lead(session),
+        speed_mps=world.ego_speed_mps,
+    )
+    action = effective_action
+    action_semantic = "follow_lead" if action in ("wait", "follow_lead") else action
+    if episode_step == 1:
+        try:
+            from perception.lead_gap_diagnostics import log_lead_gap_checkpoint
+
+            log_lead_gap_checkpoint(
+                session, "E_before_first_execute", note=f"action={action_semantic}"
+            )
+        except Exception:
+            pass
+        if session.allows_pre_decision_actor_layout():
+            if hasattr(session, "_snap_convoy_to_travel_lane"):
+                session._snap_convoy_to_travel_lane(spec)
+            if hasattr(session, "_ensure_spawn_gaps"):
+                session._ensure_spawn_gaps(spec)
+        try:
+            session.align_ego_to_travel_lane()
+            session.run_pre_control_sanity(
+                for_follow_lead=(action_semantic == "follow_lead"),
+                align_ego=False,
+                check_spawn_gaps=False,
+            )
+        except Exception as e:
+            from autopass.config import AutopassConfigurationError, is_test_mode
+
+            if is_test_mode():
+                print(f"[CARLA] Pre-control sanity skipped in test mode: {e}", flush=True)
+            else:
+                raise AutopassConfigurationError(str(e)) from e
+        for _ in range(max(1, getattr(session, "_spawn_settle_ticks", 3))):
+            session.tick()
+
+    session.enable_ego_physics(True)
+
+    from perception.actor_continuity import snapshot_continuity_baseline
+
+    snapshot_continuity_baseline(session, window_s=float(duration_s))
 
     delta = session.fixed_delta_seconds
     n_ticks = max(1, int(round(duration_s / delta)))
@@ -387,9 +584,11 @@ def execute_vehicle_step(
     last_ctrl = None
     clear_of_lead = _session_cleared_of_lead(session)
     ego_lane = session.infer_ego_lane_index()
-    control_failure = False
+    control_failure = bool(fsm_control_failure)
     lane_departure = False
     max_lane_dist = 0.0
+    initial_front = session.measure_actor_gaps_3d().get("front", 999.0)
+    pass_abort_reason = pass_st.abort_reason
 
     import carla
 
@@ -404,20 +603,97 @@ def execute_vehicle_step(
         v = _speed_mps(ego.get_velocity())
         speeds.append(v)
 
-        lane_dist = session.ego_lane_center_distance_m(ego) if hasattr(session, "ego_lane_center_distance_m") else 0.0
+        pass_st, effective_action, tick_fail = pass_control_tick(
+            session,
+            ego,
+            requested_action=requested_action,
+            pass_in_progress=pass_st.active or requested_action == "pass",
+            front_gap_m=front,
+            clear_of_lead=clear_of_lead,
+            speed_mps=v,
+        )
+        if tick_fail:
+            control_failure = True
+        action = effective_action
+        action_semantic = "follow_lead" if action in ("wait", "follow_lead") else action
+
+        if action_semantic == "follow_lead":
+            lane_metric_phase = "cruise"
+        else:
+            lane_metric_phase = resolve_pass_phase(
+                action,
+                ego_lane=ego_lane,
+                clear_of_lead=clear_of_lead,
+                front_gap_m=front,
+                pass_fsm_phase=pass_st.phase if pass_st.active else None,
+            )
+        lane_dist = (
+            session.ego_lane_center_distance_m(ego, phase=lane_metric_phase)
+            if hasattr(session, "ego_lane_center_distance_m")
+            else 0.0
+        )
         max_lane_dist = max(max_lane_dist, lane_dist)
 
-        if lane_dist > lane_departure_fail_m():
+        depart_fail_m = lane_departure_fail_m()
+        if pass_st.active and pass_st.phase in ("lane_change", "overtake", "merge_back"):
+            depart_fail_m = max(depart_fail_m, session.expected_passing_lane_width_m() * 1.15)
+
+        ctrl_dbg_pre = getattr(session, "_last_control_debug", {}) if session is not None else {}
+        head_abs = abs(float(ctrl_dbg_pre.get("heading_error_deg", 0.0)))
+        if lane_dist > lane_departure_warn_m() and (head_abs > 35.0 or lane_dist > depart_fail_m):
+            recovery_wp = (
+                session.get_recovery_travel_waypoint(ego)
+                if hasattr(session, "get_recovery_travel_waypoint")
+                else None
+            )
+            if recovery_wp is not None:
+                rec_steer, _, _ = _steer_to_waypoint(
+                    session,
+                    ego,
+                    recovery_wp,
+                    recovery=True,
+                    max_steer_override=min(0.12, max_steer()),
+                    max_delta=0.025,
+                )
+                rec_ctrl = carla.VehicleControl(
+                    throttle=0.12,
+                    brake=0.2 if v > 3.5 else 0.05,
+                    steer=rec_steer,
+                    hand_brake=False,
+                )
+                ego.apply_control(rec_ctrl)
+                last_ctrl = rec_ctrl
+                session.tick()
+                lane_dist = (
+                    session.ego_lane_center_distance_m(ego, phase="cruise")
+                    if hasattr(session, "ego_lane_center_distance_m")
+                    else lane_dist
+                )
+                max_lane_dist = max(max_lane_dist, lane_dist)
+
+        if lane_dist > depart_fail_m:
             control_failure = True
             lane_departure = True
-            session._lane_departure_stopped = True
+            from perception.pass_control_fsm import abort_pass
+
+            abort_pass(session, f"lane_departure_{lane_dist:.1f}m")
+            pass_st = get_pass_control_state(session)
+            pass_abort_reason = pass_st.abort_reason
             stop_ctrl = carla.VehicleControl(throttle=0.0, brake=1.0, steer=0.0, hand_brake=False)
             ego.apply_control(stop_ctrl)
             last_ctrl = stop_ctrl
             session.tick()
+            action = "wait"
+            action_semantic = "follow_lead"
             break
 
         recovery = lane_dist > lane_departure_warn_m()
+
+        fsm_scripted = None
+        if pass_st.active:
+            from perception.pass_control_fsm import _scripted_phase_for_fsm
+
+            fsm_scripted = _scripted_phase_for_fsm(pass_st.phase)
 
         last_ctrl = build_vehicle_control(
             action,
@@ -431,10 +707,41 @@ def execute_vehicle_step(
             front_gap_m=front,
             clear_of_lead=clear_of_lead,
             ego_lane=ego_lane,
-            recovery=recovery,
+            recovery=recovery or (episode_step == 1 and len(speeds) <= 3),
+            scripted_phase=fsm_scripted,
+            pass_fsm_phase=pass_st.phase if pass_st.active else None,
+            pass_maneuver_started=pass_st.maneuver_started,
         )
+        if episode_step == 1 and len(speeds) <= 4:
+            last_ctrl.throttle = min(float(last_ctrl.throttle), 0.22)
+            last_ctrl.brake = max(float(last_ctrl.brake), 0.08 if v > 1.5 else 0.0)
         ego.apply_control(last_ctrl)
+        session._last_vehicle_control = last_ctrl
         session.tick()
+        sink = getattr(session, "_demo_frame_sink", None)
+        import os
+
+        dense_frames = os.environ.get("AUTOPASS_DEMO_DENSE_FRAMES", "0").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        if sink is not None and (
+            dense_frames or len(speeds) % 3 == 0 or len(speeds) == n_ticks
+        ):
+            try:
+                partial = session.materialize_logical_world(
+                    world,
+                    measured_speed_mps=v,
+                    duration_s=delta * len(speeds),
+                    ego_lane=ego_lane,
+                    passed=world.passed,
+                    collision=False,
+                    done=False,
+                )
+                sink(partial, f"execute_tick_{len(speeds)}")
+            except Exception:
+                pass
 
     ctrl = last_ctrl
     measured_speed = float(sum(speeds) / len(speeds)) if speeds else world.ego_speed_mps
@@ -467,11 +774,17 @@ def execute_vehicle_step(
             collision = False
             collision_detail = ""
             collision_source = "ignored_spawn_grace"
-    near_miss = min_front < near_miss_m() and not collision
+    near_miss = _near_miss_this_step(
+        session,
+        min_front,
+        collision=collision,
+        pass_st=pass_st,
+        ego_lane=ego_lane,
+        requested_action=requested_action,
+    )
 
     done = (
         collision
-        or control_failure
         or world.ego_x_m + progress_delta >= spec.route.goal_x_m
         or world.t_s + duration_s >= 160.0
     )
@@ -501,27 +814,21 @@ def execute_vehicle_step(
     session._set_spectator_behind_ego()
 
     phase = resolve_pass_phase(
-        action, ego_lane=ego_lane, clear_of_lead=clear_of_lead, front_gap_m=min_front
+        action,
+        ego_lane=ego_lane,
+        clear_of_lead=clear_of_lead,
+        front_gap_m=min_front,
+        pass_fsm_phase=pass_st.phase if pass_st.active else None,
     )
-    target_lane_id = None
-    target_road_id = None
-    travel_lane_id = None
-    travel_road_id = None
-    if session is not None and ego is not None and session.map is not None:
-        try:
-            target_wp = session.get_steering_waypoint(ego, phase, passing_side)
-            if target_wp is not None:
-                target_lane_id = int(target_wp.lane_id)
-                target_road_id = int(target_wp.road_id)
-            if session._travel_wp is not None:
-                travel_lane_id = int(session._travel_wp.lane_id)
-                travel_road_id = int(session._travel_wp.road_id)
-        except Exception:
-            pass
+    fsm_diag = fsm_diagnostics(session, ego, pass_st)
+    target_lane_id = fsm_diag.get("target_lane_id")
+    target_road_id = fsm_diag.get("target_road_id")
+    travel_lane_id = fsm_diag.get("travel_lane_id")
+    travel_road_id = fsm_diag.get("travel_road_id")
     feedback = {
         "mode": "carla_vehicle",
         "action": action,
-        "action_semantic": "follow_lead" if action in ("wait", "follow_lead") else action,
+        "action_semantic": "follow_lead" if action in ("wait", "follow_lead") else ("pass" if action == "pass" else action),
         "ticks": n_ticks,
         "measured_speed_mps": round(measured_speed, 2),
         "progress_delta_m": round(progress_delta, 2),
@@ -545,7 +852,12 @@ def execute_vehicle_step(
         "collision_step": episode_step if collision else None,
         "episode_step": episode_step,
         "control_failure": control_failure,
-        "failure_type": "lane_departure" if lane_departure else "",
+        "failure_type": "lane_departure" if lane_departure else ("pass_control" if pass_abort_reason else ""),
+        "pass_abort_reason": pass_abort_reason,
+        "pass_maneuver_started": pass_st.maneuver_started,
+        "pass_fsm_phase": pass_st.phase,
+        "pass_fsm_active": pass_st.active,
+        "requested_action": requested_action,
         "max_lane_center_dist_m": round(max_lane_dist, 2),
         "lane_debug": session.route_cursor_debug_snapshot(ego)
         if hasattr(session, "route_cursor_debug_snapshot")
@@ -563,8 +875,31 @@ def execute_vehicle_step(
             "ego_speed_mps": round(float(ctrl_dbg.get("ego_speed_mps", measured_speed)), 3),
         }
     )
+    feedback.update(fsm_diag)
+    if (
+        pass_abort_reason
+        and not control_failure
+        and action_semantic == "follow_lead"
+        and "planner_requested" not in pass_abort_reason
+    ):
+        feedback["control_failure"] = True
+        feedback["failure_type"] = "pass_abort"
     if hasattr(session, "pass_longitudinal_snapshot"):
         feedback.update(session.pass_longitudinal_snapshot())
+    feedback["actor_continuity"] = session.longitudinal_continuity_diag(
+        pass_in_progress=pass_st.active,
+        action=action_semantic,
+        context="after_execute",
+        check_violations=True,
+    )
+    session.mark_graph_execute_completed()
+    if episode_step == 1:
+        try:
+            from perception.lead_gap_diagnostics import log_lead_gap_checkpoint
+
+            log_lead_gap_checkpoint(session, "F_after_first_execute", note=f"action={action_semantic}")
+        except Exception:
+            pass
     return world_after, feedback
 
 

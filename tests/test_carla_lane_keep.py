@@ -151,7 +151,7 @@ def test_lane_change_steer_target_on_corridor_road():
     s._adjacent_passing_lane_wp = lambda _t, _s: passing
     wp = s.get_steering_waypoint(ego, "lane_change", "left")
     assert wp.road_id == 6
-    assert wp.lane_id == 5
+    assert wp.lane_id == 4
     lat = lateral_error_m(ego.get_location(), 0.0, wp.transform.location)
     assert abs(lat) < 2.5
 

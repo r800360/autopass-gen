@@ -26,6 +26,38 @@ Under trip deadline pressure, decide **when** an AV may overtake using **only vi
 
 ## Tests that guard the claim
 
+- `pytest -q` — 199+ offline tests (SSOT, planner/critic, pass control lane targets).
 - `tests/test_perception_ssot.py` — wrong spec distances do not change pass/wait.
 - `tests/test_planner_critic.py` — agency and safety gates.
 - `tests/test_agentic_graph.py` — belief updates after execute.
+- `tests/test_pass_control_lane_target.py` — pass steers toward passing lane, not travel lane.
+
+## Production defaults
+
+| Variable | Production default | Purpose |
+|----------|-------------------|---------|
+| `AUTOPASS_MOCK_LLM` | `0` | Real OpenAI planner |
+| `AUTOPASS_DECISION_ORACLE` | `0` | No simulator axis gap fallbacks |
+| `AUTOPASS_LLM_TEMPERATURE` | `0.4` | Non-deterministic agency |
+| `AUTOPASS_PERCEPTION_BACKEND` | `carla` | Live sensors |
+| `AUTOPASS_CONTROL_MODE` | `vehicle` | CARLA VehicleControl |
+
+Control gains (`MAX_STEER`, lane-change blend) ship with **demo-safe defaults in code** — you should not need to tune env vars for hero videos. Optional `AUTOPASS_CARLA_*` overrides exist for ablations only.
+
+Trace field `metrics.agency` reports LLM rounds, vision-front steps, and critic/execute alignment.
+
+## North-star metric (CARLA hero corridors)
+
+On hero scenarios (`demo_07_clear_safe_pass_perception`, etc.):
+
+`route_completed AND pass_attempt_success AND NOT collision`
+
+Report per urgency; trace field `failure_taxonomy` classifies episodes (`control_lane_departure`, `control_incomplete`, `perception_insufficient`, …).
+
+## Pass execution (control)
+
+`perception/pass_control_fsm.py` + `perception/carla_control.py` run a bounded pass FSM:
+
+- **Wait / follow:** `target_lane_id == travel_lane_id`
+- **Pass / lane change:** `target_lane_id == passing_lane_id` (adjacent lane from spawn topology)
+- **Abort** on multi-lane departure or planner `wait` during early lane change (no silent forced pass)

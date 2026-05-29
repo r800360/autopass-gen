@@ -6,28 +6,22 @@ No default tool queue: each tool is justified from ``perception_summary`` +
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Literal, Optional
+from typing import Any, Dict, Literal, Optional, Tuple
 
 from pydantic import BaseModel, Field
 
 from autopass.dsl import PassingDSL
+from autopass.pass_gates import evaluate_pass_gates
 from autopass.perception_state import (
-    belief_is_measured,
-    deadline_pressure,
-    lead_speed_if_available,
     needed_tools,
     pass_evidence_complete,
-    slow_lead,
     urgency_level,
 )
-from autopass.safety import HARD_FLOOR_FRONT_M
+from autopass.pass_gates import MIN_PASS_FRONT_GAP_M
 from autopass.tools import TOOL_NAMES, perception_summary
 from visual_world import ScenarioSpec, WorldState
 
 PlannerAction = Literal["run_tool", "decide_maneuver", "finish"]
-
-# Vision planner gate — must align with safety margins (see estimate_pass_time front+13 m).
-MIN_PASS_FRONT_GAP_M = HARD_FLOOR_FRONT_M + 12.0
 
 
 class PlannerDecision(BaseModel):
@@ -37,57 +31,31 @@ class PlannerDecision(BaseModel):
     reasoning: str = ""
 
 
-def _pass_preconditions(dsl: PassingDSL, world: WorldState) -> tuple[bool, str]:
-    """
-  Return (may_propose_pass, wait_reasoning).
-  All checks are vision-belief only — critic remains the backstop.
-  """
-    wb = dsl.world_belief
-    gap = float(wb.front_gap_m) if wb.front_gap_m is not None else None
-    _, lead_ok = lead_speed_if_available(dsl)
-
-    if gap is not None and gap < MIN_PASS_FRONT_GAP_M and not lead_ok:
-        return (
-            False,
-            (
-                f"Front gap is only {gap:.1f}m and lead speed is unavailable; "
-                "passing is not justified, so follow/wait while continuing to monitor."
-            ),
-        )
-
-    blockers: list[str] = []
-    if not belief_is_measured(wb) or not wb.front_valid or gap is None:
-        blockers.append("front gap is not validated")
-    elif gap < MIN_PASS_FRONT_GAP_M:
-        blockers.append(
-            f"front gap is only {gap:.1f}m (below {MIN_PASS_FRONT_GAP_M:.0f}m passing threshold)"
-        )
-    if not lead_ok:
-        blockers.append("lead speed is unavailable")
-    elif not slow_lead(dsl, world):
-        blockers.append("slow lead is not confirmed from vision")
-    if not pass_evidence_complete(dsl):
-        blockers.append("pass perception evidence is incomplete")
-    if not wb.rear_valid:
-        blockers.append("rear gap is not validated for lane-change safety")
-    if wb.oncoming_available and not wb.oncoming_valid:
-        blockers.append("oncoming gap is required but not validated for this corridor")
-    if wb.oncoming_available is False and wb.oncoming_unavailable_reason:
-        pass  # oncoming not applicable — not a pass blocker
-
+def _pass_preconditions(
+    dsl: PassingDSL,
+    spec: ScenarioSpec,
+    world: WorldState,
+) -> Tuple[bool, str, Dict[str, Any]]:
+    """Return (may_propose_pass, wait_reasoning, gate_evaluation)."""
+    summary = perception_summary(dsl)
+    gates = evaluate_pass_gates(dsl, spec, world, summary=summary)
+    if gates["can_pass"]:
+        return True, "", gates
+    blockers = gates["pass_blockers"]
     if blockers:
-        return False, "; ".join(blockers).capitalize() + " — wait and monitor."
-    return True, ""
+        return False, "; ".join(blockers).capitalize() + " — wait and monitor.", gates
+    return False, "Pass gates not satisfied — wait and monitor.", gates
 
 
 def _clamp_pass_decision(
     decision: PlannerDecision,
     dsl: PassingDSL,
+    spec: ScenarioSpec,
     world: WorldState,
 ) -> PlannerDecision:
     if decision.action != "decide_maneuver" or decision.maneuver != "pass":
         return decision
-    ok, reason = _pass_preconditions(dsl, world)
+    ok, reason, _ = _pass_preconditions(dsl, spec, world)
     if ok:
         return decision
     return PlannerDecision(action="decide_maneuver", maneuver="wait", reasoning=reason)
@@ -156,7 +124,7 @@ def plan_next(
 
     if dsl.mission.aggression == "0" and decision.maneuver == "pass":
         return PlannerDecision(action="decide_maneuver", maneuver="wait", reasoning="No-pass policy.")
-    return _clamp_pass_decision(decision, dsl, world)
+    return _clamp_pass_decision(decision, dsl, spec, world)
 
 
 def _decide_maneuver_from_evidence(
@@ -183,35 +151,89 @@ def _decide_maneuver_from_evidence(
         oncoming = summary.get("measure_oncoming", {})
         if rear and not rear.get("safe", True):
             return PlannerDecision(action="decide_maneuver", maneuver="abort_pass", reasoning="Rear gap closed during pass.")
-        if oncoming and not oncoming.get("safe", True):
+        gates = evaluate_pass_gates(dsl, spec, world, summary=summary)
+        if gates["oncoming_required"] and oncoming and not oncoming.get("safe", True):
             return PlannerDecision(action="decide_maneuver", maneuver="abort_pass", reasoning="Oncoming risk during pass.")
         return PlannerDecision(action="decide_maneuver", maneuver="pass", reasoning="Pass in progress — continue actuation.")
 
-    can_pass, wait_reason = _pass_preconditions(dsl, world)
-    if not can_pass:
+    gates = evaluate_pass_gates(dsl, spec, world, summary=summary)
+    if not gates["can_pass"]:
         missing = needed_tools(dsl, spec, world)
         if missing:
             return PlannerDecision(action="run_tool", tool=missing[0][0], reasoning=missing[0][1])
-        return PlannerDecision(action="decide_maneuver", maneuver="wait", reasoning=wait_reason)
+        blockers = gates["pass_blockers"]
+        return PlannerDecision(
+            action="decide_maneuver",
+            maneuver="wait",
+            reasoning="; ".join(blockers).capitalize() + " — wait and monitor.",
+        )
 
-    rear = summary.get("measure_rear_gap", {})
-    oncoming = summary.get("measure_oncoming", {})
-    kin = summary.get("check_kinematics", {})
     traffic = summary.get("assess_traffic", {})
-
-    if rear and not rear.get("safe", True):
-        return PlannerDecision(action="decide_maneuver", maneuver="wait", reasoning="Rear gap unsafe (measured).")
-    if oncoming and not oncoming.get("safe", True):
-        return PlannerDecision(action="decide_maneuver", maneuver="wait", reasoning="Oncoming gap unsafe (measured).")
+    kin = summary.get("check_kinematics", {})
     if kin and not kin.get("feasible", True):
         if traffic.get("is_real_traffic"):
             return PlannerDecision(action="decide_maneuver", maneuver="replan", reasoning="Dense traffic — replan route.")
         return PlannerDecision(action="decide_maneuver", maneuver="wait", reasoning="Pass not kinematically feasible.")
 
+    motivations = "; ".join(gates["pass_motivation"][:3])
     u = urgency_level(spec, world)
     if u in ("high", "medium") or dsl.mission.urgency in ("high", "medium"):
-        return PlannerDecision(action="decide_maneuver", maneuver="pass", reasoning="Vision checks passed under urgency.")
-    return PlannerDecision(action="decide_maneuver", maneuver="wait", reasoning="Safe to wait — low urgency.")
+        return PlannerDecision(
+            action="decide_maneuver",
+            maneuver="pass",
+            reasoning=f"All pass gates satisfied ({motivations}).",
+        )
+    return PlannerDecision(
+        action="decide_maneuver",
+        maneuver="wait",
+        reasoning="All gates pass but urgency is low — safe to wait.",
+    )
+
+
+def _llm_decide_maneuver(
+    dsl: PassingDSL,
+    spec: ScenarioSpec,
+    world: WorldState,
+    summary: Dict[str, Any],
+    *,
+    pass_in_progress: bool = False,
+) -> PlannerDecision:
+    """Production: LLM chooses pass|wait|replan|abort_pass; gates clamp unsafe pass."""
+    from agents.llm_agents import structured_invoke
+
+    fallback = _decide_maneuver_from_evidence(
+        dsl, spec, world, summary, pass_in_progress=pass_in_progress
+    )
+    gates = evaluate_pass_gates(dsl, spec, world, summary=summary)
+    wb = summary.get("world_belief", {})
+    allowed = ("pass", "wait", "replan", "abort_pass")
+    prompt = (
+        f"Mission: {dsl.mission.text}\n"
+        f"Urgency: {dsl.mission.urgency}\n"
+        f"Deadline pressure: {urgency_level(spec, world)}\n"
+        f"Pass in progress: {pass_in_progress}\n"
+        f"World belief (vision): {wb}\n"
+        f"Pass gates (hard constraints): {gates}\n"
+        f"Perception summary: {summary}\n"
+        f"Choose action=decide_maneuver and maneuver one of {allowed}. "
+        f"Propose pass only when can_pass is true. If pass in progress and rear/oncoming unsafe, abort_pass. "
+        f"Under high urgency prefer pass when gates allow; when can_pass is false, wait or run tools next cycle."
+    )
+    decision = structured_invoke(
+        PlannerDecision,
+        "Overtaking planner agent. Decide the next maneuver from vision evidence and deadline pressure. "
+        "You are the decision authority; safety gates may override an unsafe pass.",
+        prompt,
+        fallback,
+    )
+    if decision.action != "decide_maneuver" or decision.maneuver not in allowed:
+        return fallback
+    out = PlannerDecision(
+        action="decide_maneuver",
+        maneuver=decision.maneuver,
+        reasoning=decision.reasoning or fallback.reasoning,
+    )
+    return _clamp_pass_decision(out, dsl, spec, world)
 
 
 def _llm_plan(
@@ -226,40 +248,80 @@ def _llm_plan(
 
     missing = needed_tools(dsl, spec, world, block_front_measure=block_front_measure)
     summary = perception_summary(dsl)
-    wb = summary.get("world_belief", {})
+    gates = evaluate_pass_gates(dsl, spec, world, summary=summary)
+
+    if not missing:
+        return _llm_decide_maneuver(
+            dsl, spec, world, summary, pass_in_progress=pass_in_progress
+        )
+
     fallback = _rule_plan(
         dsl, spec, world, pass_in_progress=pass_in_progress, block_front_measure=block_front_measure
     )
-    allowed = [t for t, _ in missing] if missing else []
+    allowed = [t for t, _ in missing]
+    wb = summary.get("world_belief", {})
     oncoming_note = ""
-    if wb.get("oncoming_available") is False:
-        reason = wb.get("oncoming_unavailable_reason") or "not applicable"
+    if not gates["oncoming_required"]:
+        reason = gates.get("oncoming_check_reason") or wb.get("oncoming_unavailable_reason") or "same_direction_passing_lane"
         oncoming_note = (
-            f"Oncoming is not applicable/unavailable for this corridor ({reason}); "
-            "do not claim certainty about absence of opposing traffic.\n"
+            f"Oncoming is NOT required for this corridor ({reason}). "
+            "Do not treat unavailable oncoming as a pass blocker.\n"
         )
+    elif wb.get("oncoming_available") is False:
+        oncoming_note = (
+            f"Oncoming unavailable ({wb.get('oncoming_unavailable_reason', '')}); "
+            "only block pass if oncoming_required is true.\n"
+        )
+
+    slow_lead_note = (
+        "A stationary or very slow lead (lead_speed_mps near 0) is a REASON TO PASS when "
+        "front_gap_ok, rear_gap_ok, kinematics_ok, and topology_ok are all true. "
+        "Stationary lead alone is NOT unsafe.\n"
+    )
+    rear_note = (
+        "Use measure_rear_gap.safe for rear safety — ignore raw burst rear_closing_mps if "
+        "rear_closing_valid is false or magnitude is extreme.\n"
+    )
     prompt = (
         f"Mission: {dsl.mission.text}\n"
         f"Revision: {dsl.revision}\n"
         f"Pass in progress: {pass_in_progress}\n"
         f"Measured belief: {wb}\n"
+        f"Pass gates: {gates}\n"
         f"Tools completed: {dsl.tools_completed}\n"
         f"Needed tools (pick one if any): {allowed}\n"
         f"Summary: {summary}\n"
+        f"{slow_lead_note}"
+        f"{rear_note}"
         f"{oncoming_note}"
-        f"PASS GATES (mandatory): propose pass only if front_gap_m >= {MIN_PASS_FRONT_GAP_M:.0f} m, "
-        f"lead speed is measured, rear_valid is true, pass evidence tools are complete, and "
-        f"oncoming is validated when oncoming_available is true. Otherwise choose wait.\n"
+        f"PASS GATES (mandatory): propose pass only when pass_preconditions are all true in Pass gates. "
+        f"front_gap_m must be >= {MIN_PASS_FRONT_GAP_M:.0f} m. "
         f"Never describe a gap below {MIN_PASS_FRONT_GAP_M:.0f} m as sufficient for a safe pass.\n"
-        f"If no needed tools, choose decide_maneuver (pass|wait|replan|abort_pass).\n"
+        f"If no needed tools, you must NOT choose decide_maneuver — only run_tool from Needed tools.\n"
         f"Valid tools: {TOOL_NAMES}"
     )
     decision = structured_invoke(
         PlannerDecision,
-        "Overtaking planner. Pick ONE needed vision tool OR a maneuver. "
-        "Never choose a tool not in Needed tools unless replanning after new evidence. "
+        "Overtaking planner. Pick ONE needed vision tool from Needed tools. "
+        "Do not choose decide_maneuver while tools remain in Needed tools. "
         "Under deadline pressure, still refuse pass when vision evidence is insufficient.",
         prompt,
         fallback,
     )
-    return _clamp_pass_decision(decision, dsl, world)
+    if decision.action == "decide_maneuver" and allowed:
+        return fallback
+    if decision.action == "run_tool" and allowed:
+        first_tool = allowed[0]
+        if decision.tool not in allowed:
+            return PlannerDecision(
+                action="run_tool",
+                tool=first_tool,
+                reasoning=f"Planner picked unavailable tool; using required {first_tool}.",
+            )
+        if decision.tool != first_tool:
+            return PlannerDecision(
+                action="run_tool",
+                tool=first_tool,
+                reasoning=f"Required tool order: {first_tool} before {decision.tool}.",
+            )
+    return _clamp_pass_decision(decision, dsl, spec, world)

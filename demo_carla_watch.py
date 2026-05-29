@@ -44,6 +44,10 @@ from autopass.config import apply_production_defaults, require_runtime
 
 apply_production_defaults()
 
+os.environ.setdefault("AUTOPASS_MOCK_LLM", "0")
+os.environ.setdefault("AUTOPASS_DECISION_ORACLE", "0")
+os.environ.setdefault("AUTOPASS_LLM_TEMPERATURE", "0.4")
+
 require_runtime(need_carla=True, need_openai=True)
 
 
@@ -60,7 +64,28 @@ def _ensure_curated_corridor() -> None:
 
 
 
-def _record_session(recorder, spec, world, label: str, extra: dict | None = None) -> None:
+def _display_t_s_for_frame(recorder, world, label: str) -> tuple[float, float]:
+    """HUD time (monotonic) and raw graph world.t_s for metadata."""
+    from perception.carla_scenario import get_session
+
+    graph_t = float(world.t_s)
+    session = get_session()
+    if session.ready:
+        graph_t = max(graph_t, session.graph_logical_t_s())
+    display_t = recorder.next_display_t_s(graph_t, label=label)
+    return display_t, graph_t
+
+
+def _record_session(
+    recorder,
+    spec,
+    world,
+    label: str,
+    extra: dict | None = None,
+    *,
+    graph_step: int | None = None,
+    animate_steps: int = 6,
+) -> None:
 
     from perception.carla_scenario import get_session
 
@@ -68,7 +93,8 @@ def _record_session(recorder, spec, world, label: str, extra: dict | None = None
 
     session = get_session()
 
-    session.animate_steps(spec, world, steps=6)
+    session.animate_steps(spec, world, steps=animate_steps)
+    session.wait_for_sensor_frames(max_ticks=8, timeout_s=2.0)
 
     pair = session.grab_frame_pair()
 
@@ -88,7 +114,17 @@ def _record_session(recorder, spec, world, label: str, extra: dict | None = None
 
         rgb, _, _, overhead = pair
 
-    recorder.capture(rgb, t_s=world.t_s, label=label, extra=extra, overhead=overhead)
+    display_t, graph_t = _display_t_s_for_frame(recorder, world, label)
+    meta = dict(extra or {})
+    meta["graph_t_s"] = round(graph_t, 3)
+    recorder.capture(
+        rgb,
+        t_s=display_t,
+        label=label,
+        extra=meta,
+        overhead=overhead,
+        graph_step=graph_step,
+    )
 
 
 
@@ -142,6 +178,41 @@ def run_agentic_carla_loop(spec, world, out_dir: Path, ticks_per_step: int, max_
 
     sim_world = world
 
+    session = get_session()
+
+    def _demo_sink(partial_world, tick_label: str) -> None:
+        _record_session(
+            recorder,
+            spec,
+            partial_world,
+            f"EXECUTE {tick_label}",
+            {"subframe": tick_label},
+            animate_steps=0,
+        )
+
+    session._demo_frame_sink = _demo_sink
+
+    def _recording_animate(world_state: WorldState, label: str, steps: int, *, graph_step: int | None = None, extra: dict | None = None) -> None:
+        if steps <= 0:
+            return
+
+        def _on_tick(partial_world, tick_i: int) -> None:
+            _record_session(
+                recorder,
+                spec,
+                partial_world,
+                f"{label} tick{tick_i}",
+                {**(extra or {}), "subframe": tick_i},
+                graph_step=graph_step,
+                animate_steps=0,
+            )
+
+        session.animate_steps(spec, world_state, steps=steps, on_tick=_on_tick)
+
+    # Settle sensors/actors before first frame so spawn layout is stable on video.
+    session.wait_for_sensor_frames(max_ticks=12, timeout_s=4.0)
+    session.animate_steps(spec, sim_world, steps=4)
+
     _record_session(recorder, spec, sim_world, "AGENTIC START", {"environment": env_kind, "map": map_name})
 
 
@@ -160,19 +231,23 @@ def run_agentic_carla_loop(spec, world, out_dir: Path, ticks_per_step: int, max_
 
         "max_drive_steps": max_steps,
 
+        "max_planner_rounds": 12,
+
         "perception_backend": "carla",
 
         "control_mode": os.environ.get("AUTOPASS_CONTROL_MODE", "vehicle"),
 
     }
 
+    os.environ.setdefault("AUTOPASS_VIDEO_REALTIME", "1")
+
     record_nodes = frozenset({"execute", "critique_maneuver", "planner", "run_tool"})
 
-    step = 0
+    frame_idx = 0
 
     final_state = init
 
-    for event in app.stream(init, config={"recursion_limit": 250}):
+    for event in app.stream(init, config={"recursion_limit": 300}):
 
         for node_name, update in event.items():
 
@@ -198,21 +273,68 @@ def run_agentic_carla_loop(spec, world, out_dir: Path, ticks_per_step: int, max_
 
                 extra["action"] = update.get("trace", [{}])[-1].get("action") if update.get("trace") else ""
 
-            _record_session(recorder, spec, sim_world, node_name.upper(), extra)
+            animate = ticks_per_step
 
-            get_session().animate_steps(spec, sim_world, steps=ticks_per_step)
+            if node_name == "execute":
 
-            step += 1
+                animate = 0
 
-            if step >= max_steps:
+            elif node_name in ("planner", "run_tool"):
 
-                break
+                animate = 0
 
-        if step >= max_steps:
+            if animate > 0:
 
-            break
+                _recording_animate(
+
+                    sim_world,
+
+                    node_name.upper(),
+
+                    animate,
+
+                    graph_step=frame_idx,
+
+                    extra=extra,
+
+                )
+
+            else:
+
+                _record_session(
+
+                    recorder,
+
+                    spec,
+
+                    sim_world,
+
+                    node_name.upper(),
+
+                    extra,
+
+                    graph_step=frame_idx,
+
+                    animate_steps=0,
+
+                )
+
+            frame_idx += 1
+
+            if node_name == "execute":
+
+                _recording_animate(
+                    sim_world,
+                    "EXECUTE_TAIL",
+                    min(2, ticks_per_step),
+                    graph_step=frame_idx,
+                    extra=extra,
+                )
 
 
+
+    if "world" in final_state:
+        sim_world = WorldState(**final_state["world"])
 
     _record_session(
 
@@ -230,7 +352,17 @@ def run_agentic_carla_loop(spec, world, out_dir: Path, ticks_per_step: int, max_
 
     mp4 = recorder.write_video(f"{spec.scenario_id}_{env_kind}_agentic.mp4")
 
+    session._demo_frame_sink = None
     get_session().shutdown()
+
+    import json
+
+    trace_path = out_dir / f"{spec.scenario_id}_agentic_trace.json"
+    trace_path.write_text(json.dumps(final_state.get("trace", []), indent=2), encoding="utf-8")
+    metrics_path = out_dir / f"{spec.scenario_id}_agentic_metrics.json"
+    metrics_path.write_text(json.dumps(final_state.get("metrics", {}), indent=2), encoding="utf-8")
+    print(f"[CARLA] Trace: {trace_path}")
+    print(f"[CARLA] Metrics: {metrics_path}")
 
     if mp4:
 
@@ -349,30 +481,51 @@ def main() -> None:
 
 
     if args.hero_pass:
-        from autopass.benchmark_catalog import FAMILY_TO_DEMO_ID
-        from autopass.hero_demo import resolve_hero_scenario
+        from dataclasses import replace
+
+        from autopass.scenarios import showcase_map_for_environment
+        from visual_world import curated_demo_scenarios, initialize_world
 
         family = args.scenario
-        if family.isdigit():
-            from visual_world import curated_demo_scenarios
+        map_name = showcase_map_for_environment(args.environment)
+        os.environ["AUTOPASS_CARLA_MAP"] = map_name
 
-            demos = curated_demo_scenarios()
-            idx = int(family)
-            family = next(
-                (f for f, did in FAMILY_TO_DEMO_ID.items() if did == demos[idx].scenario_id),
-                "clear_safe_pass",
-            )
-        from visual_world import initialize_world
+        use_axis_demo = family in ("6", "clear_safe_pass", "clear_safe_pass_perception")
+        if family.isdigit() and int(family) == 6:
+            use_axis_demo = True
 
-        spec, _case = resolve_hero_scenario(family, urgency=args.urgency, environment=args.environment)
+        if use_axis_demo:
+            os.environ.pop("AUTOPASS_CARLA_HERO_CORRIDOR", None)
+            os.environ["AUTOPASS_CARLA_CORRIDOR_MODE"] = "presentation"
+            os.environ.setdefault("AUTOPASS_CARLA_SKIP_PASS_BOOT_VALIDATE", "1")
+            os.environ.setdefault("AUTOPASS_CARLA_MAX_CORRIDOR_REPICK", "0")
+            spec = curated_demo_scenarios()[6]
+            spec = replace(spec, route=replace(spec.route, town=map_name))
+            family = "clear_safe_pass_perception"
+        else:
+            from autopass.benchmark_catalog import FAMILY_TO_DEMO_ID
+            from autopass.hero_demo import resolve_hero_scenario
+
+            if family.isdigit():
+                demos = curated_demo_scenarios()
+                idx = int(family)
+                family = next(
+                    (f for f, did in FAMILY_TO_DEMO_ID.items() if did == demos[idx].scenario_id),
+                    "clear_safe_pass",
+                )
+            spec, _case = resolve_hero_scenario(family, urgency=args.urgency, environment=args.environment)
+
         world = initialize_world(spec)
         args.out_dir.mkdir(parents=True, exist_ok=True)
         print("AutoPass CARLA closed-loop (agentic — vision-grounded pass/wait)")
-        print(f"  Family: {family} → {spec.scenario_id}")
+        print(f"  Family: {family} -> {spec.scenario_id}")
         print(f"  Policy: {args.policy}  Urgency: {args.urgency}")
         print(f"  Map: {spec.route.town}")
         print(f"  Output: {args.out_dir}\n")
         os.environ["AUTOPASS_CONTROL_MODE"] = "vehicle"
+        os.environ.setdefault("AUTOPASS_EXECUTE_DT_S", "1.0")
+        os.environ.setdefault("AUTOPASS_VIDEO_REALTIME", "1")
+        os.environ.setdefault("AUTOPASS_DEMO_DENSE_FRAMES", "1")
         run_agentic_carla_loop(spec, world, args.out_dir, args.ticks, args.steps)
         return
 
@@ -418,7 +571,7 @@ def main() -> None:
 
     print("AutoPass CARLA Watch (agentic)")
 
-    print(f"  Environment: {args.environment} → {os.environ['AUTOPASS_CARLA_MAP']}")
+    print(f"  Environment: {args.environment} -> {os.environ['AUTOPASS_CARLA_MAP']}")
 
     print(f"  Scenario: {spec.scenario_id}")
 

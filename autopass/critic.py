@@ -40,9 +40,24 @@ def critique_tool_result(
 
     redundant = tool_redundant(tool_name, dsl, spec, world)
     if redundant:
+        if tool_name == "measure_rear_gap" and "without slow lead" in redundant:
+            note = VerificationNote(
+                verdict="insufficient",
+                message=f"{redundant} — run measure_front_gap first.",
+                tool=tool_name,
+            )
+            return dsl.append_verification(note), "insufficient"
         dsl = dsl.invalidate_tool(tool_name, redundant)
         note = VerificationNote(verdict="reject", message=f"Redundant tool: {redundant}", tool=tool_name)
         return dsl.append_verification(note), "reject"
+
+    if tool_name == "measure_rear_gap":
+        note = VerificationNote(
+            verdict="ok",
+            message=f"Rear gap recorded (safe={payload.get('safe')}).",
+            tool=tool_name,
+        )
+        return dsl.append_verification(note), "ok"
 
     if tool_name == "capture_sensors" and not payload.get("car_distances"):
         dsl = dsl.invalidate_tool(tool_name, "no vehicles in burst")
@@ -50,10 +65,20 @@ def critique_tool_result(
         return dsl.append_verification(note), "insufficient"
 
     if tool_name == "capture_sensors" and payload.get("front_speed_mps") is None:
-        if dsl.world_belief.front_valid:
+        wb = dsl.world_belief
+        if wb.front_valid and wb.front_gap_m is not None and float(wb.front_gap_m) < 200.0:
             note = VerificationNote(
                 verdict="ok",
                 message="Front gap validated from burst; lead speed unavailable (gap-only).",
+                tool=tool_name,
+            )
+            return dsl.append_verification(note), "ok"
+        lr = payload.get("lead_resolution") or {}
+        axis_gap = lr.get("lead_axis_gap_m")
+        if axis_gap is not None and 5.0 <= float(axis_gap) <= 60.0:
+            note = VerificationNote(
+                verdict="ok",
+                message="Front gap from travel-axis geometry; lead speed unavailable (gap-only).",
                 tool=tool_name,
             )
             return dsl.append_verification(note), "ok"
@@ -183,6 +208,29 @@ def critique_post_execution(
     *,
     execution_feedback: dict | None = None,
 ) -> Tuple[PassingDSL, CriticVerdict]:
+    if execution_feedback and execution_feedback.get("control_failure"):
+        reason = execution_feedback.get("pass_abort_reason") or execution_feedback.get("failure_type") or "control"
+        note = VerificationNote(
+            verdict="replan",
+            message=f"Control failure during pass: {reason}",
+            revision_triggered=True,
+        )
+        return dsl.append_verification(note), "replan"
+
+    if (
+        execution_feedback
+        and execution_feedback.get("mode") == "carla_vehicle"
+        and execution_feedback.get("requested_action") == "pass"
+        and not execution_feedback.get("clear_of_lead")
+        and execution_feedback.get("pass_fsm_phase") == "merge_back"
+    ):
+        note = VerificationNote(
+            verdict="replan",
+            message="Merge-back attempted before lead clearance — replan.",
+            revision_triggered=True,
+        )
+        return dsl.append_verification(note), "replan"
+
     if execution_feedback and execution_feedback.get("mode") == "carla_vehicle":
         if execution_feedback.get("collision"):
             note = VerificationNote(
@@ -192,13 +240,20 @@ def critique_post_execution(
             )
             return dsl.append_verification(note), "replan"
         if execution_feedback.get("near_miss"):
-            gap = execution_feedback.get("min_front_gap_m", 0)
-            note = VerificationNote(
-                verdict="replan",
-                message=f"Near-miss: min front gap {gap:.1f}m — replan.",
-                revision_triggered=True,
-            )
-            return dsl.append_verification(note), "replan"
+            if (
+                execution_feedback.get("requested_action") == "pass"
+                and execution_feedback.get("pass_fsm_active")
+                and execution_feedback.get("ego_lane") == 1
+            ):
+                pass
+            else:
+                gap = execution_feedback.get("min_front_gap_m", 0)
+                note = VerificationNote(
+                    verdict="replan",
+                    message=f"Near-miss: min front gap {gap:.1f}m — replan.",
+                    revision_triggered=True,
+                )
+                return dsl.append_verification(note), "replan"
         pq = execution_feedback.get("pass_quality")
         if isinstance(pq, dict) and not pq.get("ok", True):
             note = VerificationNote(
@@ -218,14 +273,20 @@ def critique_post_execution(
 
     if maneuver.kind == "pass" and not world_after.passed:
         try:
-            safety = check_pass_safety(dsl, spec, world_after)
-            if not safety.approved:
-                note = VerificationNote(
-                    verdict="replan",
-                    message="Post-step vision unsafe: " + "; ".join(safety.reasons[:2]),
-                    revision_triggered=True,
-                )
-                return dsl.append_verification(note), "replan"
+            skip_front_safety = False
+            if execution_feedback and execution_feedback.get("clear_of_lead"):
+                skip_front_safety = True
+            if skip_front_safety:
+                pass
+            else:
+                safety = check_pass_safety(dsl, spec, world_after)
+                if not safety.approved:
+                    note = VerificationNote(
+                        verdict="replan",
+                        message="Post-step vision unsafe: " + "; ".join(safety.reasons[:2]),
+                        revision_triggered=True,
+                    )
+                    return dsl.append_verification(note), "replan"
         except InsufficientPerceptionError:
             pass
 

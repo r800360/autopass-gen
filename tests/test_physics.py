@@ -10,7 +10,7 @@ def test_all_comprehensive_scenarios_have_valid_initial_layout():
         issues = validate_logical_world(spec, world)
         assert not issues, f"{spec.scenario_id}: {issues}"
         issues_total += len(issues)
-    assert len(all_comprehensive_scenarios()) == 18
+    assert len(all_comprehensive_scenarios()) == 21
 
 
 def test_lead_starts_ahead_of_ego():

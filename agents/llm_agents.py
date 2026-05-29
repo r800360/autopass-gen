@@ -56,7 +56,23 @@ def structured_invoke(model: Type[T], system: str, human: str, mock_value: T) ->
     from langchain_core.messages import HumanMessage, SystemMessage
     from langchain_openai import ChatOpenAI
 
-    llm = ChatOpenAI(model=os.environ.get("AUTOPASS_LLM_MODEL", "gpt-4o-mini"), temperature=0)
+    from autopass.config import llm_temperature
+
+    llm_kwargs: Dict[str, Any] = {
+        "model": os.environ.get("AUTOPASS_LLM_MODEL", "gpt-4o-mini"),
+        "temperature": llm_temperature(),
+    }
+    try:
+        import certifi
+        import httpx
+
+        verify: Any = certifi.where()
+        if os.environ.get("AUTOPASS_OPENAI_INSECURE_SSL", "").strip() in ("1", "true", "True"):
+            verify = False
+        llm_kwargs["http_client"] = httpx.Client(verify=verify)
+    except Exception:
+        pass
+    llm = ChatOpenAI(**llm_kwargs)
     return llm.with_structured_output(model).invoke([SystemMessage(content=system), HumanMessage(content=human)])
 
 

@@ -44,7 +44,23 @@ def measure_gaps_from_frame(
     car_distances = depth_result.get("car_distances", [])
     from autopass.perception_state import classify_car_distances
 
+    from autopass.perception_state import finalize_front_lead_detection
+
     gaps, car_distances = classify_car_distances(car_distances)
+    lead_meta: Dict[str, Any] = {}
+    if source == "carla_depth":
+        try:
+            from perception.carla_actor_association import apply_carla_detection_belief
+            from perception.carla_scenario import get_session
+
+            session = get_session()
+            car_distances, gaps, lead_meta = apply_carla_detection_belief(session, car_distances)
+        except Exception:
+            car_distances = finalize_front_lead_detection(car_distances)
+            gaps = gaps_from_car_distances(car_distances)
+    else:
+        car_distances = finalize_front_lead_detection(car_distances)
+        gaps = gaps_from_car_distances(car_distances)
     front_valid = gaps["front_gap_m"] < 200.0
 
     actors = {
@@ -57,21 +73,42 @@ def measure_gaps_from_frame(
     n_cars = sum(1 for c in car_distances if c.get("median_depth", 999) < 150)
     confidence = min(1.0, 0.35 + 0.15 * n_cars)
 
+    lead_speed_obs = lead_meta.get("lead_speed_mps") if lead_meta else None
+    rear_valid = bool(lead_meta.get("rear_valid", gaps["rear_gap_m"] < 200.0))
+    oncoming_required = bool(lead_meta.get("oncoming_required", True))
+    oncoming_avail = bool(lead_meta.get("oncoming_available", True))
+    oncoming_gap = gaps["oncoming_gap_m"] if oncoming_required else None
+    oncoming_valid = oncoming_required and gaps["oncoming_gap_m"] < 200.0
     belief = WorldBelief(
         source=source,
         front_gap_m=gaps["front_gap_m"],
         rear_gap_m=gaps["rear_gap_m"],
-        oncoming_gap_m=gaps["oncoming_gap_m"],
+        oncoming_gap_m=oncoming_gap,
         front_valid=front_valid,
-        rear_valid=gaps["rear_gap_m"] < 200.0,
-        oncoming_valid=gaps["oncoming_gap_m"] < 200.0,
-        oncoming_available=True,
+        rear_valid=rear_valid,
+        oncoming_valid=oncoming_valid,
+        oncoming_available=oncoming_avail,
+        oncoming_unavailable_reason=str(lead_meta.get("oncoming_unavailable_reason", "")),
         visibility_m=float(depth_result.get("max_depth", 200.0)),
         depth_confidence=confidence,
+        lead_speed_mps=float(lead_speed_obs) if lead_speed_obs is not None and front_valid else None,
         car_distances=car_distances,
         actors=actors,
     )
-    payload = {"gaps": gaps, "car_distances": car_distances, "confidence": confidence}
+    payload = {
+        "gaps": gaps,
+        "car_distances": car_distances,
+        "confidence": confidence,
+        "lead_resolution": lead_meta,
+        "oncoming_available": oncoming_avail,
+        "oncoming_unavailable_reason": lead_meta.get("oncoming_unavailable_reason", ""),
+        "passing_topology": lead_meta.get("passing_topology"),
+        "oncoming_required": lead_meta.get("oncoming_required"),
+        "oncoming_check_reason": lead_meta.get("oncoming_check_reason"),
+        "rear_gap_source": lead_meta.get("rear_gap_source"),
+    }
+    if lead_meta.get("lead_speed_mps") is not None:
+        payload["lead_speed_mps"] = lead_meta["lead_speed_mps"]
     return belief, payload
 
 
@@ -91,18 +128,29 @@ def observe_from_carla_session(
         return None, {"error": "no_camera_frame"}
     rgb, seg, depth_m = frame
     belief, payload = measure_gaps_from_frame(seg, depth_m, source="carla_depth")
-    oncoming_actor = session.actors.get("oncoming") if hasattr(session, "actors") else None
-    has_opposing = bool(getattr(session, "_opposing_wp", None))
-    if not has_opposing or oncoming_actor is None:
-        belief.oncoming_gap_m = None
-        belief.oncoming_valid = False
-        belief.oncoming_available = False
-        belief.oncoming_unavailable_reason = "no_opposing_lane_or_actor"
+    lr = payload.get("lead_resolution") or {}
+    if not lr:
+        from perception.passing_topology import passing_lane_topology
+
+        topo = passing_lane_topology(session)
+        lr = topo
+        payload["lead_resolution"] = {**lr}
+    if lr.get("passing_topology"):
+        payload["passing_topology"] = lr["passing_topology"]
+        payload["oncoming_required"] = lr.get("oncoming_required")
+        payload["oncoming_check_reason"] = lr.get("oncoming_check_reason")
+    if not lr.get("oncoming_required", True):
+        from dataclasses import replace
+
+        belief = replace(
+            belief,
+            oncoming_gap_m=None,
+            oncoming_valid=False,
+            oncoming_available=False,
+            oncoming_unavailable_reason=str(lr.get("oncoming_unavailable_reason", "")),
+        )
         payload["oncoming_available"] = False
         payload["oncoming_unavailable_reason"] = belief.oncoming_unavailable_reason
-    else:
-        belief.oncoming_available = True
-        payload["oncoming_available"] = True
     belief = update_world_belief(
         belief,
         t_s=world.t_s,
@@ -153,8 +201,41 @@ def finalize_post_step_belief(
     from dataclasses import replace
 
     out = observed
+    try:
+        from perception.carla_scenario import get_session
+        from perception.pass_control_fsm import get_pass_control_state
+
+        session = get_session()
+        pass_active = session.ready and get_pass_control_state(session).active
+        cleared_lead = session.ready and session.ego_cleared_lead(
+            float(__import__("autopass.carla_tuning", fromlist=["merge_clear_m"]).merge_clear_m())
+        )
+    except Exception:
+        pass_active = False
+        cleared_lead = False
+
+    if (pass_active or cleared_lead) and prior.front_valid and prior.front_gap_m is not None:
+        obs_front = out.front_gap_m
+        outlier = (
+            obs_front is None
+            or not out.front_valid
+            or float(obs_front) >= 120.0
+            or abs(float(obs_front) - float(prior.front_gap_m)) > 45.0
+        )
+        if outlier:
+            out = replace(
+                out,
+                front_gap_m=prior.front_gap_m,
+                front_valid=True,
+                lead_speed_mps=prior.lead_speed_mps if prior.lead_speed_mps is not None else out.lead_speed_mps,
+            )
+            payload["belief_hold_during_pass"] = True
+            payload["rejected_observed_front_m"] = obs_front
     if out.lead_speed_mps is None and prior.lead_speed_mps is not None:
         out = replace(out, lead_speed_mps=prior.lead_speed_mps)
+    lr = payload.get("lead_resolution") or {}
+    if out.lead_speed_mps is None and lr.get("lead_speed_mps") is not None:
+        out = replace(out, lead_speed_mps=float(lr["lead_speed_mps"]))
     if out.rear_closing_mps is None and prior.rear_closing_mps is not None:
         out = replace(out, rear_closing_mps=prior.rear_closing_mps)
     if "oncoming_available" in payload:

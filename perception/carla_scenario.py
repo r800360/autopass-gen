@@ -91,6 +91,34 @@ class CarlaScenarioSession:
         self._corridor_hero_fallback = False
         self._last_corridor_diagnostics = None
         self._corridor_pick_pool: list = []
+        self._rear_on_passing_lane: bool = False
+        self._axis_ego_xyz: Optional[Tuple[float, float, float]] = None
+        self._axis_travel_dir: Optional[Tuple[float, float, float]] = None
+        self._axis_lateral_dir: Optional[Tuple[float, float, float]] = None
+        self._axis_spawn_active: bool = False
+        from perception.actor_continuity import reset_continuity_state
+
+        reset_continuity_state(self)
+
+    def allows_pre_decision_actor_layout(self) -> bool:
+        from perception.actor_continuity import allows_pre_decision_actor_layout
+
+        return allows_pre_decision_actor_layout(self)
+
+    def mark_closed_loop_actuation_begun(self) -> None:
+        from perception.actor_continuity import mark_closed_loop_actuation_begun
+
+        mark_closed_loop_actuation_begun(self)
+
+    def mark_graph_execute_completed(self) -> None:
+        from perception.actor_continuity import mark_graph_execute_completed
+
+        mark_graph_execute_completed(self)
+
+    def longitudinal_continuity_diag(self, **kwargs):
+        from perception.actor_continuity import longitudinal_continuity_diag
+
+        return longitudinal_continuity_diag(self, **kwargs)
 
     def _travel_axis(self):
         """Authoritative geometry axis: spawn travel waypoint origin + forward."""
@@ -153,6 +181,11 @@ class CarlaScenarioSession:
         """Bind logical 1D ego_x_m to CARLA travel-axis position at spawn."""
         self._spawn_logical_x = logical_ego_x
         self._spawn_ego_s = self._ego_travel_s()
+        self._last_logical_t_s = 0.0
+
+    def graph_logical_t_s(self) -> float:
+        """Authoritative closed-loop sim time (updated on each execute materialize)."""
+        return float(getattr(self, "_last_logical_t_s", 0.0))
 
     def _ego_travel_s(self) -> float:
         s = self.project_actor_along_travel_axis("ego")
@@ -208,7 +241,7 @@ class CarlaScenarioSession:
             if along is not None and along > 5.0:
                 oncoming_x = ego_x + along
 
-        return WorldState(
+        out = WorldState(
             t_s=world_before.t_s + duration_s,
             ego_x_m=ego_x,
             ego_lane=ego_lane,
@@ -220,6 +253,75 @@ class CarlaScenarioSession:
             collision=collision,
             done=done,
         )
+        self._last_logical_t_s = float(out.t_s)
+        return out
+
+    def _zero_actor_kinematics(self, actor) -> None:
+        """Clear linear/angular velocity before toggling physics (prevents spawn spin)."""
+        if actor is None or self.carla is None:
+            return
+        carla = self.carla
+        try:
+            actor.set_target_velocity(carla.Vector3D(0.0, 0.0, 0.0))
+            actor.set_target_angular_velocity(carla.Vector3D(0.0, 0.0, 0.0))
+        except Exception:
+            pass
+
+    def snap_ego_to_travel_pose(self, *, max_lateral_m: float = 4.0) -> bool:
+        """Snap ego position and yaw to the spawn travel lane at current longitudinal s."""
+        ego = self.actors.get("ego")
+        tw = self._travel_wp
+        if ego is None or tw is None or self.map is None or self.carla is None:
+            return False
+        anchor = self._travel_lane_anchor_at_ego(ego) or tw
+        from perception.carla_lane_keep import lane_center_distance_m
+
+        loc = ego.get_location()
+        if lane_center_distance_m(loc, anchor) > max_lateral_m:
+            return False
+        carla = self.carla
+        wp_loc = anchor.transform.location
+        rot = anchor.transform.rotation
+        was_phys = bool(getattr(self, "_ego_physics", False))
+        if was_phys:
+            ego.set_simulate_physics(False)
+        ego.set_transform(
+            carla.Transform(
+                carla.Location(float(wp_loc.x), float(wp_loc.y), float(wp_loc.z) + 0.25),
+                carla.Rotation(float(rot.pitch), float(rot.yaw), float(rot.roll)),
+            )
+        )
+        self._zero_vehicle_control(ego)
+        self._zero_actor_kinematics(ego)
+        self._last_steer = 0.0
+        if was_phys:
+            ego.set_simulate_physics(True)
+            self._zero_actor_kinematics(ego)
+        return True
+
+    def apply_inter_step_cruise(self, spec: ScenarioSpec, world: WorldState) -> None:
+        """Hold travel-lane cruise between graph nodes (avoid stale pass steer spinning ego)."""
+        ego = self.actors.get("ego")
+        if ego is None or not getattr(self, "_ego_physics", False):
+            return
+        from perception.carla_control import build_vehicle_control
+
+        gaps = self.measure_actor_gaps_3d()
+        ctrl = build_vehicle_control(
+            "wait",
+            world=world,
+            spec=spec,
+            session=self,
+            ego=ego,
+            measured_speed_mps=self._ego_speed_mps(),
+            front_gap_m=gaps.get("front", 999.0),
+            clear_of_lead=self.ego_clear_of_lead(),
+            ego_lane=self.infer_ego_lane_index(),
+            recovery=False,
+        )
+        ego.apply_control(ctrl)
+        self._last_vehicle_control = ctrl
+        self._last_steer = float(ctrl.steer)
 
     def enable_ego_physics(self, enabled: bool = True) -> None:
         """Enable Unreal physics on ego only; NPCs stay kinematic."""
@@ -240,7 +342,22 @@ class CarlaScenarioSession:
         if enabled:
             self._ensure_spawn_gaps()
             ego.set_autopilot(False)
-        ego.set_simulate_physics(enabled)
+            self.align_ego_to_travel_lane(max_lateral_m=3.5)
+            self.snap_ego_to_travel_pose(max_lateral_m=4.0)
+            self._zero_vehicle_control(ego)
+            ego.set_simulate_physics(False)
+            if self.world is not None:
+                self.tick()
+            self._zero_actor_kinematics(ego)
+            ego.set_simulate_physics(True)
+            self._zero_actor_kinematics(ego)
+            self._zero_vehicle_control(ego)
+            if self.world is not None:
+                for _ in range(2):
+                    self.tick()
+                    self._zero_actor_kinematics(ego)
+        else:
+            ego.set_simulate_physics(False)
 
     def measure_actor_gaps_3d(self) -> Dict[str, float]:
         from perception.carla_geometry import actor_location_tuple, euclidean_m
@@ -368,7 +485,15 @@ class CarlaScenarioSession:
         tw = self._travel_wp
         self._route_cursor = self._wp_on_lane_ahead(anchor, 2.0, tw.lane_id, tw.road_id)
 
-    def _wp_on_lane_ahead(self, wp, distance_m: float, lane_id=None, road_id=None):
+    def _wp_on_lane_ahead(
+        self,
+        wp,
+        distance_m: float,
+        lane_id=None,
+        road_id=None,
+        *,
+        same_carriageway: bool = False,
+    ):
         """Advance along the same lane/road; stop at junctions and lane changes."""
         if wp is None or distance_m < 0.5:
             return wp
@@ -386,7 +511,12 @@ class CarlaScenarioSession:
             cand = nxt[0]
             if getattr(cand, "is_junction", False):
                 break
-            if cand.lane_id != lane_id or cand.road_id != road_id:
+            if int(cand.road_id) != int(road_id):
+                break
+            if same_carriageway:
+                if int(cand.lane_id) * int(lane_id) <= 0:
+                    break
+            elif int(cand.lane_id) != int(lane_id):
                 break
             cur = cand
             remaining -= step
@@ -493,17 +623,44 @@ class CarlaScenarioSession:
         alpha = self.lane_change_blend_alpha(ego)
         return self._lane_change_blend_at(travel, passing, alpha=alpha, lookahead_m=la)
 
+    def get_passing_lane_steering_waypoint(self, ego, *, lookahead_m: float | None = None):
+        """Lookahead on the spawn adjacent passing lane centerline (not travel lane)."""
+        from types import SimpleNamespace
+
+        from autopass.carla_tuning import route_lookahead_m
+
+        tw = self._travel_wp
+        pw = self._passing_wp
+        if pw is None or ego is None or tw is None:
+            return pw
+        la = float(lookahead_m) if lookahead_m is not None else min(8.0, route_lookahead_m() * 0.55)
+        travel = self._travel_lane_anchor_at_ego(ego) or tw
+        passing = self._adjacent_passing_lane_wp(travel, self._passing_side or "left") or pw
+        ahead = self._wp_on_lane_ahead(passing, la, int(pw.lane_id), int(pw.road_id))
+        ref = ahead or passing
+        return SimpleNamespace(
+            lane_id=int(pw.lane_id),
+            road_id=int(pw.road_id),
+            transform=ref.transform,
+        )
+
     def _lane_change_steer_waypoint(self, ego, passing_side: str = "left"):
         """Steering reference on corridor road_id/lane_id with blended lateral target."""
         from types import SimpleNamespace
 
+        pw = self._passing_wp
         travel = self._travel_lane_anchor_at_ego(ego) or self._travel_wp
         loc = self.get_lane_change_steer_target_location(ego)
         if travel is None or loc is None:
             return self._travel_wp
+        alpha = self.lane_change_blend_alpha(ego) if ego is not None else 0.0
+        passing = self._adjacent_passing_lane_wp(travel, self._passing_side or passing_side)
+        ref_meta = passing if (pw is not None and alpha >= 0.1 and passing is not None) else travel
+        if pw is not None and alpha >= 0.1:
+            ref_meta = pw
         return SimpleNamespace(
-            lane_id=int(travel.lane_id),
-            road_id=int(travel.road_id),
+            lane_id=int(ref_meta.lane_id),
+            road_id=int(ref_meta.road_id),
             transform=SimpleNamespace(
                 location=loc,
                 rotation=travel.transform.rotation,
@@ -606,6 +763,101 @@ class CarlaScenarioSession:
                 return True
         return False
 
+    def get_travel_steering_waypoint(self, ego, *, lookahead_m: float | None = None):
+        """
+        Cruise / wait steering target on the spawn travel lane at ego longitude.
+
+        Uses the curated travel axis (not a long wp.next chain) so ego on an adjacent
+        projected lane still steers toward the correct centerline.
+        """
+        from types import SimpleNamespace
+
+        from autopass.carla_tuning import route_lookahead_m
+
+        tw = self._travel_wp
+        if tw is None or ego is None:
+            return tw
+        la = float(lookahead_m) if lookahead_m is not None else min(8.0, route_lookahead_m() * 0.5)
+        anchor = self._travel_lane_anchor_at_ego(ego) or tw
+        axis = self._travel_axis()
+        if axis is not None:
+            _, fwd = axis
+            loc = anchor.transform.location
+            carla = self.carla
+            target_loc = carla.Location(
+                float(loc.x) + float(fwd[0]) * la,
+                float(loc.y) + float(fwd[1]) * la,
+                float(loc.z) + float(fwd[2]) * la,
+            )
+            return SimpleNamespace(
+                lane_id=int(tw.lane_id),
+                road_id=int(tw.road_id),
+                transform=SimpleNamespace(
+                    location=target_loc,
+                    rotation=anchor.transform.rotation,
+                ),
+            )
+        return self._wp_on_lane_ahead(anchor, la, tw.lane_id, tw.road_id)
+
+    def align_ego_to_travel_lane(self, *, max_lateral_m: float = 2.5) -> bool:
+        """Snap ego onto spawn travel lane center if map projection put it on an adjacent lane."""
+        ego = self.actors.get("ego")
+        tw = self._travel_wp
+        if ego is None or tw is None or self.map is None:
+            return False
+        try:
+            ego_wp = self.map.get_waypoint(ego.get_location(), project_to_road=True)
+        except Exception:
+            return False
+        if ego_wp.road_id == tw.road_id and ego_wp.lane_id == tw.lane_id:
+            return False
+        anchor = self._travel_lane_anchor_at_ego(ego)
+        if anchor is None:
+            return False
+        from perception.carla_lane_keep import lane_center_distance_m
+
+        if lane_center_distance_m(ego.get_location(), anchor) > max_lateral_m:
+            return False
+        carla = self.carla
+        loc = anchor.transform.location
+        rot = anchor.transform.rotation
+        ego.set_transform(
+            carla.Transform(
+                carla.Location(float(loc.x), float(loc.y), float(loc.z) + 0.25),
+                carla.Rotation(float(rot.pitch), float(rot.yaw), float(rot.roll)),
+            )
+        )
+        print(
+            f"[CARLA] Aligned ego to travel lane {tw.road_id}/{tw.lane_id} "
+            f"(was {ego_wp.road_id}/{ego_wp.lane_id})",
+            flush=True,
+        )
+        return True
+
+    def run_pre_control_sanity(
+        self,
+        *,
+        for_follow_lead: bool = True,
+        align_ego: bool = True,
+        check_spawn_gaps: bool = True,
+    ) -> Dict[str, object]:
+        """Log diagnostics; optionally align ego; fail fast unless test mode."""
+        from autopass.config import is_test_mode
+        from perception.carla_pre_control import assert_pre_control_sanity, log_pre_control_diagnostic
+
+        if align_ego:
+            self.align_ego_to_travel_lane()
+        log_pre_control_diagnostic(self, for_follow_lead=for_follow_lead)
+        ok, issues, diag = assert_pre_control_sanity(
+            self,
+            for_follow_lead=for_follow_lead,
+            check_spawn_gaps=check_spawn_gaps,
+            raise_on_fail=not is_test_mode(),
+        )
+        if not ok:
+            print("[CARLA] Pre-control sanity issues: " + "; ".join(issues), flush=True)
+        return diag
+
     def ego_lane_center_distance_m(self, ego, phase: str | None = None) -> float:
         """Distance to lane center for the lane ego is actually occupying."""
         from perception.carla_lane_keep import lane_center_distance_m
@@ -620,6 +872,10 @@ class CarlaScenarioSession:
             ego_wp = self.map.get_waypoint(loc, project_to_road=True)
         except Exception:
             ego_wp = None
+
+        if phase in ("cruise", "travel") and tw is not None:
+            anchor = self._travel_lane_anchor_at_ego(ego) or tw
+            return lane_center_distance_m(loc, anchor)
 
         if phase == "merge_back" and tw is not None:
             anchor = self._travel_lane_anchor_at_ego(ego) or tw
@@ -686,27 +942,36 @@ class CarlaScenarioSession:
             return self._travel_wp
         tw = self._travel_wp
         side = self._passing_side or passing_side
-        if phase == "lane_change" and self._passing_wp is not None:
+        if phase in ("cruise", "travel"):
+            return self.get_travel_steering_waypoint(ego)
+        if phase == "merge":
+            return self.get_travel_steering_waypoint(ego)
+        if phase in ("approach", "prepare_pass", "lane_change") and self._passing_wp is not None:
             return self._lane_change_steer_waypoint(ego, side)
         if phase == "overtake" and self._passing_wp is not None:
-            # Stay on spawn passing lane/road — never chase map-projected parallel roads.
-            pw = self._passing_wp
-            ego_anchor = self._travel_lane_anchor_at_ego(ego) or tw
-            passing = self._adjacent_passing_lane_wp(ego_anchor, side)
-            if passing is not None and int(passing.road_id) == int(pw.road_id):
-                la = route_lookahead_m() * 0.75
-                horiz = self.remaining_lane_horizon_m(ego, pw.lane_id, pw.road_id)
-                la = min(la, max(4.0, horiz - 2.0))
-                return self._wp_on_lane_ahead(passing, la, pw.lane_id, pw.road_id)
-        anchor = self._travel_lane_anchor_at_ego(ego) or tw
-        if tw is None:
-            return anchor
-        return self._wp_on_lane_ahead(anchor, route_lookahead_m(), tw.lane_id, tw.road_id)
+            return self.get_passing_lane_steering_waypoint(ego)
+        return self.get_travel_steering_waypoint(ego)
 
-    def _snap_convoy_to_travel_lane(self) -> None:
+    def _snap_convoy_to_travel_lane(self, spec: ScenarioSpec | None = None) -> None:
         """Keep ego/lead/rear on the spawn travel lane (avoid parallel-road projection)."""
+        if not self.allows_pre_decision_actor_layout():
+            return
         tw = self._travel_wp
         if tw is None or self.map is None:
+            return
+        if spec is not None and self._uses_axis_spawn(spec):
+            for name, role, dist, rear_pass in (
+                ("ego", "travel", 0.0, False),
+                ("lead", "lead", self._spawn_lead_m, False),
+                ("rear", "rear", self._spawn_rear_m, self._rear_on_passing_lane),
+            ):
+                actor = self.actors.get(name)
+                if actor is None:
+                    continue
+                rear_lane = "passing" if rear_pass else "travel"
+                tf = self._layout_transform(name, dist, lane=rear_lane, spec=spec)
+                actor.set_transform(tf)
+            self.refresh_axis_ego_from_live()
             return
         for name, role, dist in (
             ("ego", "travel", 0.0),
@@ -725,12 +990,16 @@ class CarlaScenarioSession:
             except Exception:
                 pass
 
-    def _ensure_spawn_gaps(self) -> None:
+    def _ensure_spawn_gaps(self, spec: ScenarioSpec | None = None) -> None:
         """Rear must start behind ego on the travel lane with safe longitudinal gap."""
-        if not self.ready:
+        if not self.allows_pre_decision_actor_layout():
+            return
+        if not self.ready and (spec is None or not self._uses_axis_spawn(spec)):
             return
         min_rear = rear_follow_min_m() + 4.0
         min_lead = max(10.0, safe_follow_m() - 2.0)
+        if spec is not None and self._uses_axis_spawn(spec):
+            min_lead = max(min_lead, float(self._spawn_profile(spec).get("lead_floor_m", min_lead)))
         self._spawn_rear_m = max(self._spawn_rear_m, min_rear)
         self._spawn_lead_m = max(self._spawn_lead_m, min_lead)
         rear = self.actors.get("rear")
@@ -741,27 +1010,75 @@ class CarlaScenarioSession:
                     break
                 extra = rear_follow_min_m() - gap + 5.0
                 self._spawn_rear_m += extra
-                rear.set_transform(self._role_transform("rear", self._spawn_rear_m))
+                if spec is not None and self._uses_axis_spawn(spec) and self._rear_on_passing_lane:
+                    self._place_actor_longitudinal(
+                        "rear", self._spawn_rear_m, lane="passing", spec=spec
+                    )
+                else:
+                    rear.set_transform(
+                        self._role_transform(
+                            "rear", self._spawn_rear_m, rear_on_passing_lane=self._rear_on_passing_lane
+                        )
+                    )
         lead = self.actors.get("lead")
         if lead is not None and self.lead_longitudinal_gap_m() < min_lead:
             self._spawn_lead_m = max(self._spawn_lead_m, min_lead)
-            lead.set_transform(self._role_transform("lead", self._spawn_lead_m))
+            if spec is not None and self._uses_axis_spawn(spec):
+                self._place_actor_longitudinal("lead", self._spawn_lead_m, lane="travel", spec=spec)
+            else:
+                lead.set_transform(self._role_transform("lead", self._spawn_lead_m))
 
     def tick_npcs_kinematic(self, spec: ScenarioSpec, dt: float) -> None:
         if not self.ready:
             return
-        self._step_lead_npc(spec, dt)
+        profile = self._spawn_profile(spec)
+        lead_speed = float(profile.get("lead_speed_mps", spec.lead.speed_mps))
+        self._kinematic_lead_speed_mps = lead_speed
+        self._step_lead_npc(spec, dt, speed_mps=lead_speed)
         self._step_rear_npc(spec, dt)
         if self.actors.get("oncoming") is not None:
             self._step_actor_forward("oncoming", spec.oncoming.speed_mps, dt)
 
-    def _step_lead_npc(self, spec: ScenarioSpec, dt: float) -> None:
+    def _step_actor_along_travel_axis(self, name: str, speed_mps: float, dt: float) -> None:
+        """Small forward step along cached travel axis (safe for axis-spawn demos)."""
+        from perception.carla_axis_spawn import normalize3
+        from perception.carla_geometry import actor_location_tuple
+
+        actor = self.actors.get(name)
+        basis = self._ego_travel_basis()
+        if actor is None or basis is None:
+            return
+        _ego_xyz, travel, _lat = basis
+        travel = normalize3(travel)
+        loc = actor_location_tuple(actor)
+        if loc is None:
+            return
+        step_m = max(0.05, float(speed_mps) * float(dt))
+        try:
+            tf = actor.get_transform()
+            carla = self.carla
+            new_loc = carla.Location(
+                loc[0] + travel[0] * step_m,
+                loc[1] + travel[1] * step_m,
+                loc[2] + travel[2] * step_m,
+            )
+            actor.set_transform(carla.Transform(new_loc, tf.rotation))
+        except Exception:
+            pass
+
+    def _step_lead_npc(self, spec: ScenarioSpec, dt: float, *, speed_mps: float | None = None) -> None:
         if self.lead_longitudinal_gap_m() < 5.0:
             return
-        self._step_npc_on_travel_lane("lead", spec.lead.speed_mps, dt)
+        spd = float(speed_mps if speed_mps is not None else spec.lead.speed_mps)
+        # Always follow spawn travel-lane centerline — never ego-forward axis (yaw drift veers lead off road).
+        self._step_npc_on_travel_lane("lead", spd, dt)
 
     def _step_rear_npc(self, spec: ScenarioSpec, dt: float) -> None:
         """Rear follows ego — never rams a slow/stopped ego (common on first physics step)."""
+        if getattr(self, "_rear_on_passing_lane", False) and self._uses_axis_spawn(spec):
+            follow_gap = max(float(self._spawn_rear_m), rear_follow_min_m())
+            self._hold_rear_on_passing_lane(follow_gap)
+            return
         gap = self.rear_longitudinal_gap_m()
         min_gap = rear_follow_min_m()
         crit = 7.0
@@ -778,7 +1095,11 @@ class CarlaScenarioSession:
         # During ego pass / lane change, hold rear back so it does not close to <8m.
         if gap < 28.0 and ego_sp > 2.0:
             desired = min(desired, max(0.0, ego_sp - 1.5))
-        self._step_npc_on_travel_lane("rear", desired, dt)
+        self._kinematic_rear_speed_mps = float(desired)
+        if getattr(self, "_rear_on_passing_lane", False) and self._uses_axis_spawn(spec):
+            self._hold_rear_on_passing_lane(max(float(self._spawn_rear_m), rear_follow_min_m()))
+        else:
+            self._step_npc_on_travel_lane("rear", desired, dt)
 
     def _step_npc_on_travel_lane(self, name: str, speed_mps: float, dt: float) -> None:
         """Advance NPC along spawn travel lane/road — never drift to parallel segments."""
@@ -786,12 +1107,19 @@ class CarlaScenarioSession:
         tw = self._travel_wp
         if actor is None or self.map is None or tw is None:
             return
-        step_m = max(0.05, speed_mps * dt)
+        step_m = max(0.0, speed_mps * dt)
+        if step_m < 1e-6:
+            return
         try:
-            anchor = self._travel_lane_anchor_at_ego(actor) or tw
-            if anchor.road_id != tw.road_id or anchor.lane_id != tw.lane_id:
-                anchor = tw
-            nxt = self._wp_on_lane_ahead(anchor, step_m, tw.lane_id, tw.road_id)
+            s = self.project_actor_along_travel_axis(actor)
+            if s is None:
+                if name == "lead":
+                    s = float(self._spawn_lead_m)
+                elif name == "rear":
+                    s = -float(self._spawn_rear_m)
+                else:
+                    s = 0.0
+            nxt = self._wp_on_lane_ahead(tw, float(s) + step_m, tw.lane_id, tw.road_id)
             if nxt is None:
                 return
             loc = nxt.transform.location
@@ -799,6 +1127,421 @@ class CarlaScenarioSession:
             actor.set_transform(self.carla.Transform(loc, nxt.transform.rotation))
         except Exception:
             pass
+
+    def _hold_rear_on_passing_lane(self, gap_m: float) -> None:
+        """Keep rear on the passing lane at a fixed travel-axis gap behind ego."""
+        rear = self.actors.get("rear")
+        tw = self._travel_wp
+        pw = self._passing_wp
+        ego = self.actors.get("ego")
+        if rear is None or tw is None or pw is None or ego is None or self.carla is None:
+            return
+        anchor = self._travel_lane_anchor_at_ego(ego) or tw
+        rear_travel = self._wp_behind(anchor, float(gap_m))
+        passing = self._adjacent_passing_lane_wp(rear_travel, self._passing_side or "left") or pw
+        loc = passing.transform.location
+        loc.z += 0.3
+        rear.set_transform(
+            self.carla.Transform(loc, passing.transform.rotation)
+        )
+
+    def _same_carriageway(self, wp_a, wp_b) -> bool:
+        if wp_a is None or wp_b is None:
+            return False
+        try:
+            if int(wp_a.road_id) != int(wp_b.road_id):
+                return False
+            return int(wp_a.lane_id) * int(wp_b.lane_id) > 0
+        except Exception:
+            return False
+
+    def assert_convoy_on_travel_corridor(self) -> None:
+        """Fail fast if ego/lead are not on the curated travel carriageway."""
+        from autopass.config import AutopassConfigurationError, is_test_mode
+
+        tw = self._travel_wp
+        if tw is None or self.map is None:
+            return
+
+        def _collect_issues() -> list[str]:
+            issues: list[str] = []
+            for name in ("ego", "lead"):
+                actor = self.actors.get(name)
+                if actor is None:
+                    continue
+                try:
+                    wp = self.map.get_waypoint(actor.get_location(), project_to_road=True)
+                except Exception as e:
+                    issues.append(f"{name}_waypoint: {e}")
+                    continue
+                if not self._same_carriageway(wp, tw):
+                    issues.append(
+                        f"{name}_wrong_carriageway lane={wp.lane_id} road={wp.road_id} "
+                        f"(travel lane={tw.lane_id} road={tw.road_id})"
+                    )
+                elif int(wp.lane_id) != int(tw.lane_id):
+                    issues.append(
+                        f"{name}_off_travel_lane lane={wp.lane_id} (expected {tw.lane_id})"
+                    )
+            return issues
+
+        issues = _collect_issues()
+        if issues:
+            ego = self.actors.get("ego")
+            lead = self.actors.get("lead")
+            spec_hint = None
+            if self._scenario_id and "clear_safe_pass_perception" in self._scenario_id:
+                from visual_world import curated_demo_scenarios
+
+                for s in curated_demo_scenarios():
+                    if s.scenario_id == self._scenario_id:
+                        spec_hint = s
+                        break
+            if ego is not None:
+                ego.set_transform(self._layout_transform("ego", 0.0, spec=spec_hint))
+            if lead is not None:
+                lead.set_transform(self._layout_transform("lead", float(self._spawn_lead_m), spec=spec_hint))
+            if self.is_synchronous_mode():
+                self.tick()
+            issues = _collect_issues()
+        if issues and not is_test_mode():
+            raise AutopassConfigurationError(
+                "CARLA convoy spawn incoherent — ego/lead must share travel lane:\n  - "
+                + "\n  - ".join(issues)
+            )
+
+    def advance_perception_burst_frame(self, spec: ScenarioSpec, dt: float) -> None:
+        """Advance simulator during capture burst so depth-derived speeds are measurable."""
+        if not self.ready:
+            return
+        if getattr(self, "_closed_loop_actuation_begun", False):
+            ego = self.actors.get("ego")
+            self._apply_last_vehicle_control(ego)
+            self.tick_npcs_kinematic(spec, dt)
+            self.tick()
+            return
+        profile = self._spawn_profile(spec)
+        lead_speed = float(profile.get("lead_speed_mps", spec.lead.speed_mps))
+        # Ego stays put; axis-spawn scenarios restore lead after burst — do not waypoint-step lead
+        # (wp.next can jump backward toward ego and defeat restore).
+        if not self._uses_axis_spawn(spec):
+            self._step_npc_on_travel_lane("lead", lead_speed, dt)
+        if self.actors.get("rear") is not None:
+            if getattr(self, "_rear_on_passing_lane", False) and self._uses_axis_spawn(spec):
+                self._hold_rear_on_passing_lane(float(self._spawn_rear_m))
+            else:
+                self._step_npc_on_travel_lane("rear", min(spec.rear.speed_mps, lead_speed + 1.0), dt)
+        self.tick()
+
+    @staticmethod
+    def _spawn_profile(spec: ScenarioSpec) -> Dict[str, float | bool]:
+        """CARLA layout knobs keyed by scenario_id (ScenarioSpec distances are orchestration only)."""
+        sid = spec.scenario_id
+        if "clear_safe_pass_perception" in sid:
+            return {
+                "axis_spawn": True,
+                "lead_cap_m": 38.0,
+                "lead_floor_m": 32.0,
+                "lead_gap_m": 32.0,
+                "rear_passing_lane": True,
+                "rear_spawn_m": 18.0,
+                "lead_speed_mps": float(spec.lead.speed_mps),
+            }
+        return {
+            "axis_spawn": False,
+            "lead_cap_m": 22.0,
+            "lead_floor_m": 12.0,
+            "lead_gap_m": 0.0,
+            "rear_passing_lane": False,
+            "rear_spawn_m": 0.0,
+            "lead_speed_mps": float(spec.lead.speed_mps),
+        }
+
+    def _uses_axis_spawn(self, spec: ScenarioSpec) -> bool:
+        return bool(self._spawn_profile(spec).get("axis_spawn"))
+
+    def _uses_axis_longitudinal_layout(self, spec: ScenarioSpec | None = None) -> bool:
+        """True when lead/rear should be placed via world-axis offset, not waypoint.next."""
+        if spec is not None and self._uses_axis_spawn(spec):
+            return True
+        if getattr(self, "_axis_spawn_active", False):
+            return True
+        return self._axis_ego_xyz is not None and self._axis_travel_dir is not None
+
+    def _forward_unit_from_rotation(self, rotation) -> Tuple[float, float, float]:
+        """Unreal/CARLA yaw-pitch forward vector (world space)."""
+        from perception.carla_axis_spawn import normalize3
+
+        yaw = math.radians(float(rotation.yaw))
+        pitch = math.radians(float(rotation.pitch))
+        x = math.cos(pitch) * math.cos(yaw)
+        y = math.cos(pitch) * math.sin(yaw)
+        z = math.sin(pitch)
+        return normalize3((x, y, z))
+
+    def _cache_axis_basis_from_ego_transform(self, ego_tf) -> None:
+        """Cache spawn-time ego pose — get_location() is often (0,0,0) until the next tick."""
+        from perception.carla_axis_spawn import normalize3
+
+        loc = ego_tf.location
+        self._axis_ego_xyz = (float(loc.x), float(loc.y), float(loc.z))
+        travel = self._forward_unit_from_rotation(ego_tf.rotation)
+        if self._travel_wp is not None:
+            try:
+                tw_fwd = self._travel_wp.transform.get_forward_vector()
+                travel = normalize3((float(tw_fwd.x), float(tw_fwd.y), float(tw_fwd.z)))
+            except Exception:
+                pass
+        self._axis_travel_dir = travel
+        lateral = (0.0, 0.0, 0.0)
+        if self.map is not None and self._passing_wp is not None:
+            try:
+                ego_wp = self.map.get_waypoint(loc, project_to_road=True)
+                passing = self._adjacent_passing_lane_wp(ego_wp, self._passing_side or "left")
+                if passing is not None:
+                    tloc = ego_wp.transform.location
+                    ploc = passing.transform.location
+                    lateral = normalize3(
+                        (float(ploc.x - tloc.x), float(ploc.y - tloc.y), float(ploc.z - tloc.z))
+                    )
+            except Exception:
+                pass
+        self._axis_lateral_dir = lateral
+
+    def _refresh_axis_basis_from_actors(self) -> None:
+        """After a tick, actor locations are trustworthy — refresh cached basis."""
+        ego = self.actors.get("ego")
+        if ego is None:
+            return
+        try:
+            loc = ego.get_location()
+            if abs(loc.x) + abs(loc.y) > 1.0:
+                if getattr(self, "_closed_loop_actuation_begun", False):
+                    self._axis_ego_xyz = (float(loc.x), float(loc.y), float(loc.z))
+                    return
+                self._cache_axis_basis_from_ego_transform(ego.get_transform())
+        except Exception:
+            pass
+
+    def refresh_axis_ego_from_live(self) -> None:
+        """Re-cache travel basis from current ego pose (before longitudinal placement)."""
+        self._refresh_axis_basis_from_actors()
+
+    def restore_lead_spawn_longitudinal_gap(self, spec: ScenarioSpec) -> None:
+        """Re-place lead at spawn_lead_m from live ego (after perception burst stepping)."""
+        self._restore_lead_called_this_step = True
+        if not self.ready or not self._uses_axis_spawn(spec):
+            return
+        if not self.allows_pre_decision_actor_layout():
+            return
+        self.refresh_axis_ego_from_live()
+        self._place_actor_longitudinal("lead", float(self._spawn_lead_m), lane="travel", spec=spec)
+        if self.is_synchronous_mode():
+            self.tick()
+
+    def _ego_travel_basis(self) -> Optional[Tuple[Tuple[float, float, float], Tuple[float, float, float], Tuple[float, float, float]]]:
+        """
+        World-space basis: (ego_xyz, travel_unit, lateral_unit toward passing lane).
+        Uses cached spawn transform when CARLA has not synced actor locations yet.
+        """
+        if self._axis_ego_xyz is not None and self._axis_travel_dir is not None:
+            lat = self._axis_lateral_dir or (0.0, 0.0, 0.0)
+            return self._axis_ego_xyz, self._axis_travel_dir, lat
+        ego = self.actors.get("ego")
+        if ego is None:
+            return None
+        self._cache_axis_basis_from_ego_transform(ego.get_transform())
+        return self._ego_travel_basis()
+
+    def _passing_lane_lateral_offset_m(self) -> float:
+        """Meters from travel-lane center to passing-lane center at spawn corridor."""
+        tw = self._travel_wp
+        pw = self._passing_wp
+        if tw is None or pw is None:
+            return 3.5
+        try:
+            tloc = tw.transform.location
+            ploc = pw.transform.location
+            return float(
+                math.sqrt(
+                    (ploc.x - tloc.x) ** 2 + (ploc.y - tloc.y) ** 2 + (ploc.z - tloc.z) ** 2
+                )
+            )
+        except Exception:
+            return 3.5
+
+    def _role_transform_for_actor(self, name: str, ahead_m: float, *, lane: str = "travel") -> object:
+        """Waypoint-based spawn transform on the curated corridor (never world-axis offset)."""
+        rear_pass = bool(getattr(self, "_rear_on_passing_lane", False))
+        if name == "lead":
+            return self._role_transform("lead", float(ahead_m))
+        if name == "rear":
+            return self._role_transform(
+                "rear",
+                abs(float(ahead_m)),
+                rear_on_passing_lane=rear_pass or lane == "passing",
+            )
+        if name == "ego":
+            return self._role_transform("travel", 0.0)
+        return self._role_transform("travel", 0.0)
+
+    def _transform_from_ego_longitudinal(
+        self,
+        ahead_m: float,
+        *,
+        lane: str = "travel",
+        spec: ScenarioSpec | None = None,
+    ):
+        """Layout placement: axis offset for demo_07; corridor waypoints otherwise."""
+        if self._uses_axis_longitudinal_layout(spec):
+            self.refresh_axis_ego_from_live()
+        if not self._uses_axis_longitudinal_layout(spec):
+            if self._travel_wp is not None:
+                if float(ahead_m) >= 0.0:
+                    return self._role_transform_for_actor("lead", float(ahead_m), lane=lane)
+                return self._role_transform_for_actor("rear", float(ahead_m), lane=lane)
+        from perception.carla_axis_spawn import world_location_from_ego_offset
+
+        carla = self.carla
+        basis = self._ego_travel_basis()
+        if basis is None or carla is None:
+            return None
+        ego_xyz, travel, lateral_unit = basis
+        lateral_m = 0.0
+        if lane == "passing":
+            lateral_m = self._passing_lane_lateral_offset_m()
+            if lateral_m < 0.5:
+                lateral_m = min(4.5, max(2.5, self.expected_passing_lane_width_m()))
+        x, y, z = world_location_from_ego_offset(
+            ego_xyz,
+            travel,
+            lateral_unit,
+            longitudinal_m=float(ahead_m),
+            lateral_m=float(lateral_m),
+        )
+        ego_actor = self.actors.get("ego")
+        rot = ego_actor.get_transform().rotation if ego_actor is not None else None
+        if rot is None:
+            return None
+        return carla.Transform(
+            carla.Location(float(x), float(y), float(z) + 0.3),
+            carla.Rotation(rot.pitch, rot.yaw, rot.roll),
+        )
+
+    def _axis_spawn_gap_metrics(self) -> Dict[str, float]:
+        from perception.carla_axis_spawn import euclidean_distance_m, projected_distance_m
+        from perception.carla_geometry import actor_location_tuple
+
+        basis = self._ego_travel_basis()
+        out: Dict[str, float] = {}
+        if basis is None:
+            return out
+        cached_ego, travel, _ = basis
+        ego_xyz = actor_location_tuple(self.actors.get("ego"))
+        if ego_xyz is None or (abs(ego_xyz[0]) + abs(ego_xyz[1]) < 1.0):
+            ego_xyz = cached_ego
+        for name, req_key in (("lead", "lead"), ("rear", "rear")):
+            other = actor_location_tuple(self.actors.get(name))
+            if other is None:
+                continue
+            proj = projected_distance_m(ego_xyz, other, travel)
+            if name == "rear":
+                proj = max(0.0, -float(proj))
+            else:
+                proj = max(0.0, float(proj))
+            out[f"actual_projected_{req_key}_gap_m"] = round(proj, 2)
+            out[f"actual_euclidean_{req_key}_dist_m"] = round(float(euclidean_distance_m(ego_xyz, other)), 2)
+        return out
+
+    def _log_axis_spawn_layout(self, spec: ScenarioSpec) -> None:
+        from perception.carla_geometry import actor_location_tuple
+
+        basis = self._ego_travel_basis()
+        ego_xyz = actor_location_tuple(self.actors.get("ego"))
+        if basis is None or ego_xyz is None:
+            print("[CARLA] Axis spawn layout: basis unavailable", flush=True)
+            return
+        _, travel, lateral = basis
+        metrics = self._axis_spawn_gap_metrics()
+        print(
+            "[CARLA] Axis spawn layout:\n"
+            f"  ego_location=({ego_xyz[0]:.1f}, {ego_xyz[1]:.1f}, {ego_xyz[2]:.1f})\n"
+            f"  travel_direction=({travel[0]:.4f}, {travel[1]:.4f}, {travel[2]:.4f})\n"
+            f"  lateral_direction=({lateral[0]:.4f}, {lateral[1]:.4f}, {lateral[2]:.4f})\n"
+            f"  requested_lead_gap_m={self._spawn_lead_m:.1f}\n"
+            f"  actual_projected_lead_gap_m={metrics.get('actual_projected_lead_gap_m', -1):.1f}\n"
+            f"  actual_euclidean_lead_dist_m={metrics.get('actual_euclidean_lead_dist_m', -1):.1f}\n"
+            f"  requested_rear_gap_m={self._spawn_rear_m:.1f}\n"
+            f"  actual_projected_rear_gap_m={metrics.get('actual_projected_rear_gap_m', -1):.1f}\n"
+            f"  actual_euclidean_rear_dist_m={metrics.get('actual_euclidean_rear_dist_m', -1):.1f}",
+            flush=True,
+        )
+        lead_proj = metrics.get("actual_projected_lead_gap_m", 0.0)
+        if lead_proj < 26.0:
+            print(
+                f"[CARLA] WARNING: projected lead gap {lead_proj:.1f}m < 26m at spawn_index="
+                f"{getattr(self._corridor_report, 'spawn_index', '?')}",
+                flush=True,
+            )
+
+    def _layout_transform(
+        self,
+        name: str,
+        ahead_m: float,
+        *,
+        lane: str = "travel",
+        spec: ScenarioSpec | None = None,
+    ):
+        """Spawn/layout transform — axis offset for demo_07, waypoint chain otherwise."""
+        if self._uses_axis_longitudinal_layout(spec):
+            if name == "lead":
+                return self._transform_from_ego_longitudinal(float(ahead_m), lane="travel", spec=spec)
+            if name == "rear":
+                rear_lane = "passing" if lane == "passing" or self._rear_on_passing_lane else "travel"
+                return self._transform_from_ego_longitudinal(-abs(float(ahead_m)), lane=rear_lane, spec=spec)
+            if name in ("ego", "travel"):
+                return self._transform_from_ego_longitudinal(0.0, lane="travel", spec=spec)
+            return self._transform_from_ego_longitudinal(float(ahead_m), lane=lane, spec=spec)
+        if name == "lead":
+            return self._role_transform("lead", float(ahead_m))
+        if name == "rear":
+            return self._role_transform(
+                "rear",
+                abs(float(ahead_m)),
+                rear_on_passing_lane=bool(lane == "passing" or self._rear_on_passing_lane),
+            )
+        if name in ("ego", "travel"):
+            return self._role_transform("travel", 0.0)
+        return self._transform_from_ego_longitudinal(ahead_m, lane=lane, spec=spec)
+
+    def _place_actor_longitudinal(
+        self,
+        name: str,
+        ahead_m: float,
+        *,
+        lane: str = "travel",
+        layout_snap: bool = True,
+        spec: ScenarioSpec | None = None,
+    ) -> bool:
+        actor = self.actors.get(name)
+        if actor is None:
+            return False
+        tf = self._layout_transform(name, ahead_m, lane=lane, spec=spec)
+        if tf is None:
+            return False
+        if not layout_snap:
+            actor.set_transform(tf)
+            return True
+        from perception.actor_continuity import apply_layout_transform
+
+        if name == "rear":
+            self._restore_rear_called_this_step = True
+        return apply_layout_transform(
+            self,
+            actor,
+            tf,
+            reason=f"place_{name}_longitudinal_{ahead_m:.1f}m_{lane}",
+        )
 
     def _step_actor_forward(self, name: str, speed_mps: float, dt: float) -> None:
         actor = self.actors.get(name)
@@ -819,6 +1562,8 @@ class CarlaScenarioSession:
 
     def sync_npc_poses(self, spec: ScenarioSpec, world: WorldState) -> None:
         if not self.ready or self._ego_physics:
+            return
+        if self._uses_axis_spawn(spec) or not self.allows_pre_decision_actor_layout():
             return
         scale = self._spawn_lead_m / max(1.0, spec.lead.distance_m)
         gap_m = max(3.0, world.lead_x_m - world.ego_x_m) if not world.passed else world.lead_x_m - world.ego_x_m
@@ -902,6 +1647,9 @@ class CarlaScenarioSession:
     def reset_episode_state(self, *, settle: bool = True) -> None:
         """Reset per-episode counters, steering reference, and collision history."""
         self._episode_step = 0
+        from perception.actor_continuity import reset_continuity_state
+
+        reset_continuity_state(self)
         self._collision_events = []
         self._route_cursor = self._travel_wp
         self._last_steer = 0.0
@@ -920,6 +1668,12 @@ class CarlaScenarioSession:
         if settle:
             for _ in range(self._spawn_settle_ticks):
                 self.tick()
+            try:
+                from perception.lead_gap_diagnostics import log_lead_gap_checkpoint
+
+                log_lead_gap_checkpoint(self, "B_after_post_spawn_settle")
+            except Exception:
+                pass
 
     def end_episode(self) -> None:
         """Park actors kinematically before the next benchmark row respawns."""
@@ -1037,8 +1791,15 @@ class CarlaScenarioSession:
             self._spawn_ego_s = None
             self._spawn_logical_x = None
             self.init_logical_anchor(world.ego_x_m)
-            self._ensure_spawn_gaps()
+            self._ensure_spawn_gaps(spec)
             self.reset_episode_state(settle=True)
+            try:
+                self.assert_convoy_on_travel_corridor()
+                self.run_pre_control_sanity(for_follow_lead=True, align_ego=True)
+            except Exception as e:
+                self.last_error = str(e)
+                print(f"[CARLA] Respawn failed pre-control: {e}", flush=True)
+                return False
             if not self.wait_for_sensor_frames(max_ticks=50, timeout_s=10.0):
                 self.last_error = "sensor warmup failed after respawn"
                 return False
@@ -1108,16 +1869,46 @@ class CarlaScenarioSession:
             self.world.tick()
 
             self._spawn_scenario(spec, world, repick_spawn=True)
+            self._extend_lead_to_target_gap(float(self._spawn_lead_m), spec=spec)
+            max_repick = int(os.environ.get("AUTOPASS_CARLA_MAX_CORRIDOR_REPICK", "5"))
+            if (
+                self._uses_axis_spawn(spec)
+                and self.lead_longitudinal_gap_m() < 26.0
+                and max_repick > 0
+            ):
+                if self._try_repick_corridor_for_pass(spec, world):
+                    self._extend_lead_to_target_gap(float(self._spawn_lead_m), spec=spec)
+                    print(
+                        f"[CARLA] Repicked corridor for axis pass demo; lead_gap="
+                        f"{self.lead_longitudinal_gap_m():.1f}m",
+                        flush=True,
+                    )
+                elif self.lead_longitudinal_gap_m() < 26.0:
+                    print(
+                        "[CARLA] WARNING: no corridor repick achieved >=26m lead gap; "
+                        "demo_07 may not reach pass gates on this map spawn.",
+                        flush=True,
+                    )
             if self._require_pass_maneuver_validation() and not self._validate_spawn_pass_maneuver(spec, world):
-                if not self._try_repick_corridor_for_pass(spec, world):
+                if max_repick > 0 and self._try_repick_corridor_for_pass(spec, world):
+                    self._extend_lead_to_target_gap(float(self._spawn_lead_m), spec=spec)
+                else:
                     self.last_error = "pass_maneuver_validation_failed"
                     print(f"[CARLA] Bootstrap failed: {self.last_error}")
                     return False
+            self._assert_required_actors()
             self._attach_sensors()
             self._set_spectator_behind_ego()
             self.init_logical_anchor(world.ego_x_m)
-            self._ensure_spawn_gaps()
+            self._ensure_spawn_gaps(spec)
             self.reset_episode_state(settle=True)
+            try:
+                self.assert_convoy_on_travel_corridor()
+                self.run_pre_control_sanity(for_follow_lead=True, align_ego=True)
+            except Exception as e:
+                self.last_error = str(e)
+                print(f"[CARLA] Bootstrap failed pre-control: {e}", flush=True)
+                return False
             if not self.wait_for_sensor_frames(max_ticks=50, timeout_s=10.0):
                 self.last_error = "sensor warmup failed after bootstrap"
                 return False
@@ -1220,11 +2011,16 @@ class CarlaScenarioSession:
         self._pass_maneuver_validated = result.ok
         # Restore spawn layout after dry-run validation maneuver
         if self.actors.get("ego"):
-            self.actors["ego"].set_transform(self._role_transform("travel", 0.0))
+            self.actors["ego"].set_transform(self._layout_transform("ego", 0.0, spec=spec))
         if self.actors.get("lead"):
-            self.actors["lead"].set_transform(self._role_transform("lead", self._spawn_lead_m))
+            self.actors["lead"].set_transform(
+                self._layout_transform("lead", self._spawn_lead_m, spec=spec)
+            )
         if self.actors.get("rear"):
-            self.actors["rear"].set_transform(self._role_transform("rear", self._spawn_rear_m))
+            rear_lane = "passing" if self._rear_on_passing_lane else "travel"
+            self.actors["rear"].set_transform(
+                self._layout_transform("rear", self._spawn_rear_m, lane=rear_lane, spec=spec)
+            )
         if self.actors.get("oncoming"):
             self.actors["oncoming"].set_transform(self._role_transform("oncoming", self._spawn_on_m))
         self.reset_episode_state(settle=True)
@@ -1277,7 +2073,7 @@ class CarlaScenarioSession:
             self._destroy_actors_and_sensors()
             self._apply_corridor_pick(spawns, rec)
             self._spawn_scenario(spec, world, repick_spawn=False)
-            self._ensure_spawn_gaps()
+            self._ensure_spawn_gaps(spec)
             self.reset_episode_state(settle=True)
             if self._validate_spawn_pass_maneuver(spec, world):
                 return True
@@ -1554,13 +2350,19 @@ class CarlaScenarioSession:
             detail = ", ".join(report.issues[:6]) if report.issues else "unknown"
             raise AutopassConfigurationError(f"{NOT_CURATED_CORRIDOR_MSG} ({detail})")
 
-    def _wp_ahead(self, base_wp, distance_m: float):
+    def _wp_ahead(self, base_wp, distance_m: float, *, same_carriageway: bool = False):
         if distance_m < 0.5:
             return base_wp
         tw = self._travel_wp
-        if tw is not None and base_wp is not None:
-            if base_wp.road_id == tw.road_id and base_wp.lane_id == tw.lane_id:
-                locked = self._wp_on_lane_ahead(base_wp, distance_m, tw.lane_id, tw.road_id)
+        if tw is not None and base_wp is not None and int(base_wp.road_id) == int(tw.road_id):
+            if same_carriageway or int(base_wp.lane_id) == int(tw.lane_id):
+                locked = self._wp_on_lane_ahead(
+                    base_wp,
+                    distance_m,
+                    tw.lane_id,
+                    tw.road_id,
+                    same_carriageway=same_carriageway,
+                )
                 if locked is not None:
                     return locked
         nxt = base_wp.next(distance_m)
@@ -1608,12 +2410,58 @@ class CarlaScenarioSession:
             pass
         return self._wp_ahead(self._opposing_wp, distance_m)
 
-    def _role_transform(self, role: str, distance_m: float):
+    def _extend_lead_to_target_gap(self, target_m: float, spec: ScenarioSpec | None = None) -> None:
+        """Move lead forward until projected gap reaches target_m."""
+        lead = self.actors.get("lead")
+        if lead is None:
+            return
+        if self._uses_axis_longitudinal_layout(spec):
+            self.refresh_axis_ego_from_live()
+            tf = self._transform_from_ego_longitudinal(float(target_m), lane="travel", spec=spec)
+            if tf is not None:
+                lead.set_transform(tf)
+            return
+        tw = self._travel_wp
+        if tw is None or self.map is None or self.carla is None:
+            return
+        for _ in range(16):
+            gap = self.lead_longitudinal_gap_m()
+            if gap >= float(target_m) - 0.75:
+                return
+            extra = max(2.0, float(target_m) - gap)
+            try:
+                lead_wp = self.map.get_waypoint(lead.get_location(), project_to_road=True)
+            except Exception:
+                return
+            nwp = self._wp_on_lane_ahead(
+                lead_wp,
+                extra,
+                tw.lane_id,
+                tw.road_id,
+                same_carriageway=True,
+            )
+            if nwp is None:
+                return
+            loc = nwp.transform.location
+            loc.z += 0.3
+            lead.set_transform(self.carla.Transform(loc, nwp.transform.rotation))
+
+    def _assert_required_actors(self) -> None:
+        from autopass.config import AutopassConfigurationError, is_test_mode
+
+        missing = [n for n in ("ego", "lead") if self.actors.get(n) is None]
+        if missing and not is_test_mode():
+            raise AutopassConfigurationError(
+                f"CARLA bootstrap missing required actors: {', '.join(missing)}"
+            )
+
+    def _role_transform(self, role: str, distance_m: float, *, rear_on_passing_lane: bool = False):
         carla = self.carla
         if role == "lead":
-            wp = self._wp_ahead(self._travel_wp, distance_m)
+            wp = self._wp_ahead(self._travel_wp, distance_m, same_carriageway=True)
         elif role == "rear":
-            wp = self._wp_behind(self._travel_wp, distance_m)
+            base = self._passing_wp if rear_on_passing_lane and self._passing_wp is not None else self._travel_wp
+            wp = self._wp_behind(base, distance_m)
         elif role == "oncoming":
             wp = self._opposing_wp_ahead(distance_m)
         elif role == "passing":
@@ -1637,6 +2485,7 @@ class CarlaScenarioSession:
             return None
 
     def _spawn_scenario(self, spec: ScenarioSpec, world: WorldState, *, repick_spawn: bool = True) -> None:
+        self._scenario_id = spec.scenario_id
         if repick_spawn or self._travel_wp is None:
             self._pick_highway_spawn()
         bp_lib = self.world.get_blueprint_library()
@@ -1645,23 +2494,67 @@ class CarlaScenarioSession:
         rear_bp = bp_lib.filter("vehicle.nissan.micra")[0]
         on_bp = bp_lib.filter("vehicle.volkswagen.t2")[0]
 
-        self._spawn_lead_m = max(min(spec.lead.distance_m, 22.0), 12.0)
-        self._spawn_rear_m = max(
-            min(max(8.0, world.ego_x_m - world.rear_x_m), 30.0),
-            rear_follow_min_m() + 4.0,
-        )
+        profile = self._spawn_profile(spec)
+        lead_cap = float(profile["lead_cap_m"])
+        lead_floor = float(profile["lead_floor_m"])
+        axis_spawn = bool(profile.get("axis_spawn"))
+        self._axis_spawn_active = axis_spawn
+        if axis_spawn and float(profile.get("lead_gap_m", 0.0)) > 0:
+            self._spawn_lead_m = float(profile["lead_gap_m"])
+        else:
+            self._spawn_lead_m = max(min(spec.lead.distance_m, lead_cap), lead_floor)
+        rear_on_passing = bool(profile.get("rear_passing_lane"))
+        self._rear_on_passing_lane = rear_on_passing
+        if rear_on_passing:
+            self._spawn_rear_m = max(float(profile.get("rear_spawn_m", 14.0)), rear_follow_min_m() + 2.0)
+        else:
+            self._spawn_rear_m = max(
+                min(max(8.0, world.ego_x_m - world.rear_x_m), 30.0),
+                rear_follow_min_m() + 4.0,
+            )
         self._spawn_on_m = min(max(18.0, world.oncoming_x_m - world.ego_x_m), 50.0)
 
         print("[CARLA] Spawning actors:")
-        self.actors["ego"] = self._spawn_one(ego_bp, self._role_transform("travel", 0.0), "ego")
-        self.actors["lead"] = self._spawn_one(
-            lead_bp, self._role_transform("lead", self._spawn_lead_m), "lead"
-        )
-        self.actors["rear"] = self._spawn_one(
-            rear_bp, self._role_transform("rear", self._spawn_rear_m), "rear"
-        )
-        self._ensure_spawn_gaps()
-        self._snap_convoy_to_travel_lane()
+        ego_tf = self._role_transform("travel", 0.0)
+        self.actors["ego"] = self._spawn_one(ego_bp, ego_tf, "ego")
+        if axis_spawn:
+            self._cache_axis_basis_from_ego_transform(ego_tf)
+            self.actors["lead"] = self._spawn_one(
+                lead_bp,
+                self._layout_transform("lead", self._spawn_lead_m, spec=spec),
+                "lead",
+            )
+            rear_lane = "passing" if rear_on_passing else "travel"
+            self.actors["rear"] = self._spawn_one(
+                rear_bp,
+                self._layout_transform("rear", self._spawn_rear_m, lane=rear_lane, spec=spec),
+                "rear",
+            )
+        else:
+            self.actors["lead"] = self._spawn_one(
+                lead_bp, self._role_transform("lead", self._spawn_lead_m), "lead"
+            )
+            self.actors["rear"] = self._spawn_one(
+                rear_bp,
+                self._role_transform("rear", self._spawn_rear_m, rear_on_passing_lane=rear_on_passing),
+                "rear",
+            )
+        self._ensure_spawn_gaps(spec)
+        self._snap_convoy_to_travel_lane(spec)
+        self._extend_lead_to_target_gap(float(self._spawn_lead_m), spec=spec)
+        if axis_spawn:
+            if self.is_synchronous_mode():
+                self.tick()
+            ego = self.actors.get("ego")
+            if ego is not None:
+                self._cache_axis_basis_from_ego_transform(ego.get_transform())
+            self._log_axis_spawn_layout(spec)
+            try:
+                from perception.lead_gap_diagnostics import log_lead_gap_checkpoint
+
+                log_lead_gap_checkpoint(self, "A_after_actor_spawn", note=spec.scenario_id)
+            except Exception:
+                pass
         if self._opposing_wp is not None:
             self.actors["oncoming"] = self._spawn_one(
                 on_bp, self._role_transform("oncoming", self._spawn_on_m), "oncoming"
@@ -1682,10 +2575,64 @@ class CarlaScenarioSession:
             self.sync_npc_poses(spec, world)
         self._set_spectator_behind_ego()
 
-    def animate_steps(self, spec: ScenarioSpec, world: WorldState, steps: int = 8) -> None:
-        for _ in range(steps):
+    def _apply_last_vehicle_control(self, ego) -> None:
+        ctrl = getattr(self, "_last_vehicle_control", None)
+        if ctrl is None or ego is None:
+            return
+        try:
+            ego.apply_control(ctrl)
+        except Exception:
+            pass
+
+    def animate_steps(
+        self,
+        spec: ScenarioSpec,
+        world: WorldState,
+        steps: int = 8,
+        *,
+        on_tick=None,
+    ) -> None:
+        """Advance CARLA for recording/sensors; keep physics running between graph steps."""
+        if steps <= 0:
+            return
+        ego = self.actors.get("ego")
+        dt = float(getattr(self, "fixed_delta_seconds", 0.05) or 0.05)
+        pass_active = False
+        try:
+            from perception.pass_control_fsm import get_pass_control_state
+
+            pst = get_pass_control_state(self)
+            pass_active = bool(
+                pst.active and pst.phase in ("lane_change", "overtake", "merge_back", "prepare_pass")
+            )
+        except Exception:
+            pass_active = False
+        for tick_i in range(steps):
             self.apply_world_state(spec, world)
+            if getattr(self, "_ego_physics", False) and ego is not None:
+                if pass_active:
+                    self._apply_last_vehicle_control(ego)
+                else:
+                    self.apply_inter_step_cruise(spec, world)
+            self.tick_npcs_kinematic(spec, dt)
             self.tick()
+            if on_tick is None or ego is None:
+                continue
+            try:
+                v = math.sqrt(ego.get_velocity().x ** 2 + ego.get_velocity().y ** 2 + ego.get_velocity().z ** 2)
+                ego_lane = self.infer_ego_lane_index()
+                partial = self.materialize_logical_world(
+                    world,
+                    measured_speed_mps=float(v),
+                    duration_s=dt * (tick_i + 1),
+                    ego_lane=ego_lane,
+                    passed=world.passed,
+                    collision=False,
+                    done=False,
+                )
+                on_tick(partial, tick_i + 1)
+            except Exception:
+                pass
 
     def _configure_camera_bp(self, bp, *, width: int = 640, height: int = 256, fov: float = 90.0):
         bp.set_attribute("image_size_x", str(width))

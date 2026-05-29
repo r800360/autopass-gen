@@ -252,6 +252,19 @@ def curated_demo_scenarios() -> List[ScenarioSpec]:
             weather=WeatherSpec(rain=0.05, fog=0.05),
             sensor=SensorSpec(noise_std_m=0.08),
         ),
+        # CARLA positive pass demo: wide lead gap, slow lead, rear visible in passing lane (index 6).
+        ScenarioSpec(
+            scenario_id="demo_07_clear_safe_pass_perception",
+            route=base_route,
+            request=RequestSpec(text="I need to reach B very soon.", deadline_s=18.0),
+            ego_speed_mps=12.5,
+            lead=VehicleSpec(distance_m=42.0, speed_mps=4.2),
+            rear=VehicleSpec(distance_m=55.0, speed_mps=8.5),
+            oncoming=VehicleSpec(distance_m=320.0, speed_mps=9.0),
+            occlusion=OcclusionSpec(kind="none", severity=0.0, sight_distance_m=220.0),
+            weather=WeatherSpec(),
+            sensor=SensorSpec(noise_std_m=0.05),
+        ),
     ]
 
 

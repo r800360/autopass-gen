@@ -17,6 +17,7 @@ FAMILY_TO_DEMO_ID: Dict[str, str] = {
     "slow_lead_low_urgency": "demo_04_low_urgency_wait_is_ok",
     "fast_rear_vehicle": "demo_05_fast_rear_rejected",
     "slow_lead_high_urgency": "demo_06_medium_safe_selective_pass",
+    "clear_safe_pass_perception": "demo_07_clear_safe_pass_perception",
     "repeated_blockage_or_replan": "demo_03_occluded_boundary_replan",
 }
 

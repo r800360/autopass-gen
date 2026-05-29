@@ -48,20 +48,31 @@ def check_pass_safety(
     t_pass = estimate_pass_time(front_m, speeds["ego_mps"], speeds["lead_mps"])
     buffer_m = 12.0 * scale
 
-    rear_closing = speeds["rear_closing_mps"]
+    from autopass.pass_gates import rear_closing_from_log
+
+    rear_closing, rear_closing_trusted, _ = rear_closing_from_log(dsl)
+    if not rear_closing_trusted:
+        rear_closing = 0.0
     rear_ttc = math.inf if rear_closing <= 1e-6 else rear_m / rear_closing
+
+    wb = dsl.world_belief
     oncoming_closing = speeds["oncoming_closing_mps"]
-    oncoming_ttc = oncoming_m / max(1e-6, oncoming_closing)
+    if wb.oncoming_available is False or wb.oncoming_gap_m is None:
+        oncoming_ttc = math.inf
+        required_oncoming = 0.0
+    else:
+        oncoming_ttc = oncoming_m / max(1e-6, oncoming_closing)
+        required_oncoming = max(HARD_FLOOR_ONCOMING_M, oncoming_closing * t_pass + buffer_m)
     min_ttc = min(rear_ttc, oncoming_ttc)
 
-    required_oncoming = max(HARD_FLOOR_ONCOMING_M, oncoming_closing * t_pass + buffer_m)
     required_visibility = max(HARD_FLOOR_VISIBILITY_M, speeds["ego_mps"] * t_pass + buffer_m)
     required_rear = max(HARD_FLOOR_REAR_M, 16.0 * scale + rear_closing * 2.0 * scale)
 
     if rear_m < required_rear:
         reasons.append(f"rear gap too small: {rear_m:.1f} < {required_rear:.1f} m")
-    if oncoming_m < required_oncoming:
-        reasons.append(f"oncoming gap too small: {oncoming_m:.1f} < {required_oncoming:.1f} m")
+    if wb.oncoming_available is not False and wb.oncoming_gap_m is not None:
+        if oncoming_m < required_oncoming:
+            reasons.append(f"oncoming gap too small: {oncoming_m:.1f} < {required_oncoming:.1f} m")
     if vis < required_visibility:
         reasons.append(f"visibility too low: {vis:.1f} < {required_visibility:.1f} m")
     if front_m < HARD_FLOOR_FRONT_M:

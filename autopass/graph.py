@@ -120,9 +120,12 @@ def node_planner(state: AgenticState) -> Dict[str, Any]:
     mf_streak = int(state.get("measure_front_insufficient_streak", 0))
     unresolved = int(state.get("unresolved_front_resense_count", 0))
     fallback_reason = state.get("fallback_reason", "") or ""
+    from autopass.config import decision_oracle_enabled
+
     decision = None
     forced_phase = ""
     forced_tool = ""
+    agency_source = "llm" if not __import__("agents.llm_agents", fromlist=["use_mock_llm"]).use_mock_llm() else "rules"
 
     if unresolved >= MAX_UNRESOLVED_FRONT_RESENSE:
         forced_phase = "decide"
@@ -149,6 +152,22 @@ def node_planner(state: AgenticState) -> Dict[str, Any]:
             pass_in_progress=pass_active,
             block_front_measure=block_front,
         )
+        from autopass.perception_state import needed_tools
+        from autopass.planner import PlannerDecision
+
+        missing = needed_tools(dsl, spec, world, block_front_measure=block_front)
+        if missing and decision.action == "run_tool":
+            required_tool, required_why = missing[0]
+            if decision.tool != required_tool:
+                decision = PlannerDecision(
+                    action="run_tool",
+                    tool=required_tool,
+                    reasoning=f"Enforcing required tool order: {required_why}",
+                )
+    from autopass.pass_gates import evaluate_pass_gates
+    from autopass.tools import perception_summary
+
+    gate_eval = evaluate_pass_gates(dsl, spec, world, summary=perception_summary(dsl))
     trace = list(state.get("trace", []))
     trace.append(
         {
@@ -179,6 +198,16 @@ def node_planner(state: AgenticState) -> Dict[str, Any]:
             "oncoming_unavailable_reason": dsl.world_belief.oncoming_unavailable_reason,
             "depth_confidence": dsl.world_belief.depth_confidence,
             "car_distances_count": len(dsl.world_belief.car_distances),
+            "pass_preconditions": gate_eval.get("pass_preconditions"),
+            "pass_blockers": gate_eval.get("pass_blockers"),
+            "pass_motivation": gate_eval.get("pass_motivation"),
+            "can_pass": gate_eval.get("can_pass"),
+            "oncoming_required": gate_eval.get("oncoming_required"),
+            "passing_topology": gate_eval.get("passing_topology"),
+            "decision_rule_source": gate_eval.get("decision_rule_source"),
+            "agency_source": agency_source,
+            "decision_oracle_enabled": decision_oracle_enabled(),
+            "belief_calibrated_source": (dsl.world_belief.car_distances[0].get("calibrated_gap_source") if dsl.world_belief.car_distances else None),
         }
     )
     out: Dict[str, Any] = {
@@ -238,7 +267,12 @@ def node_run_tool(state: AgenticState) -> Dict[str, Any]:
             "recommendation": "resense" if tool != "capture_sensors" else "wait_for_valid_belief",
         }
     trace = list(state.get("trace", []))
-    trace.append({"node": "tool", "tool": tool, "payload_keys": list(payload.keys())})
+    tool_trace: dict = {"node": "tool", "tool": tool, "payload_keys": list(payload.keys())}
+    if tool == "capture_sensors":
+        for key in ("actor_continuity_before", "actor_continuity_after"):
+            if key in payload:
+                tool_trace[key] = payload[key]
+    trace.append(tool_trace)
     return {"dsl": dsl_to_dict(dsl), "trace": trace, "tool_payload": payload, "phase": "critique_tool"}
 
 
@@ -310,7 +344,21 @@ def node_critique_maneuver(state: AgenticState) -> Dict[str, Any]:
         plan = replace(plan, kind="wait", reasoning="No-pass policy: wait only.")
         verdict = "ok"
     trace = list(state.get("trace", []))
-    trace.append({"node": "critic_maneuver", "maneuver": maneuver, "verdict": verdict, "approved": plan.kind})
+    from autopass.pass_gates import evaluate_pass_gates
+    from autopass.tools import perception_summary
+
+    gate_eval = evaluate_pass_gates(dsl, spec, world, summary=perception_summary(dsl))
+    trace.append(
+        {
+            "node": "critic_maneuver",
+            "maneuver": maneuver,
+            "verdict": verdict,
+            "approved": plan.kind,
+            "proposed_maneuver": maneuver,
+            "pass_preconditions": gate_eval.get("pass_preconditions"),
+            "pass_blockers": gate_eval.get("pass_blockers"),
+        }
+    )
     pass_in_progress = state.get("pass_in_progress", False)
     if plan.kind == "pass":
         pass_in_progress = True
@@ -352,16 +400,24 @@ def node_execute(state: AgenticState) -> Dict[str, Any]:
     approved = state.get("approved_maneuver", "wait")
     action = clamp_maneuver_for_policy(policy, approved)
     pass_active = bool(state.get("pass_in_progress", False))
-    if pass_active and action != "pass" and policy != "no_pass":
-        action = "pass"
-    maneuver_started = action == "pass" and not pass_active
-    if maneuver_started:
+    if approved == "pass" and not pass_active:
         pass_active = True
+    # Do not override planner/critic wait with forced pass — executor handles safe abort/hold.
+    if pass_active and approved == "pass":
+        action = "pass"
+    elif pass_active and approved == "abort_pass":
+        action = "wait"
+    elif pass_active and approved == "wait":
+        action = "wait"
+    maneuver_started = False
 
     world_before = world
     pre_belief_front_m = dsl.world_belief.front_gap_m
     backend = state.get("perception_backend", get_perception_backend())
-    world_after, dsl, feedback = execute_step(spec, world, dsl, action, backend=backend, dt=1.0)
+    import os
+
+    execute_dt = float(os.environ.get("AUTOPASS_EXECUTE_DT_S", "0.5"))
+    world_after, dsl, feedback = execute_step(spec, world, dsl, action, backend=backend, dt=execute_dt)
     from autopass.belief import observed_front_gap_m
 
     obs_payload = feedback.get("observation") or {}
@@ -384,25 +440,57 @@ def node_execute(state: AgenticState) -> Dict[str, Any]:
     dsl, verdict = critique_post_execution(
         dsl, spec, world_before, world_after, dsl.maneuver, execution_feedback=feedback
     )
+    maneuver_started = bool(feedback.get("pass_maneuver_started", False))
     maneuver_completed = action == "pass" and _pass_maneuver_complete(world_after, feedback)
+    if feedback.get("pass_fsm_active") is False and pass_active and feedback.get("pass_abort_reason"):
+        pass_active = False
+    if feedback.get("control_failure") and feedback.get("pass_abort_reason"):
+        pass_active = False
     if action == "pass" and maneuver_completed:
         pass_active = False
         world_after = replace(world_after, passed=True)
 
+    proposed = state.get("proposed_maneuver", "wait")
+    if action == "pass":
+        if proposed != "pass":
+            execution_outcome = "pass_attempt_blocked_by_critic"
+        elif feedback.get("collision"):
+            execution_outcome = "pass_attempt_collision"
+        elif feedback.get("control_failure"):
+            execution_outcome = "pass_attempt_failed_control"
+        elif verdict == "replan":
+            execution_outcome = "pass_attempt_replan"
+        elif maneuver_completed:
+            execution_outcome = "pass_attempt_success"
+        else:
+            execution_outcome = "pass_attempt_in_progress"
+    else:
+        execution_outcome = "wait_success" if action == "wait" else f"{action}_executed"
+
     if verdict == "replan":
-        dsl = replace(
-            dsl,
-            tools_pending=[],
-            tools_completed=[],
-            maneuver=ManeuverPlan(),
+        fsm_active = bool(feedback.get("pass_fsm_active"))
+        recoverable_pass = (
+            fsm_active
+            and action == "pass"
+            and not feedback.get("control_failure")
+            and not feedback.get("collision")
         )
-        pass_active = False
+        if not recoverable_pass:
+            dsl = replace(
+                dsl,
+                tools_pending=[],
+                tools_completed=[],
+                maneuver=ManeuverPlan(),
+            )
+            pass_active = False
 
     trace = list(state.get("trace", []))
+    obs_payload = feedback.get("observation") or {}
+    lead_res = obs_payload.get("lead_resolution") or {}
     trace.append(
         {
             "node": "execute",
-            "action": action,
+            "action": feedback.get("action", action),
             "action_semantic": feedback.get("action_semantic", ("follow_lead" if action == "wait" else action)),
             "requested_action": approved,
             "policy": policy,
@@ -439,6 +527,30 @@ def node_execute(state: AgenticState) -> Dict[str, Any]:
             "last_insufficient_tool": state.get("last_insufficient_tool", ""),
             "perception_retry_count": state.get("perception_retry_count", 0),
             "fallback_reason": state.get("fallback_reason", ""),
+            "lead_resolution": lead_res,
+            "lead_resolution_reason": lead_res.get("front_resolution_reason"),
+            "calibrated_gap_source": lead_res.get("calibrated_gap_source"),
+            "used_detection_for_front": lead_res.get("used_detection_for_front"),
+            "rear_gap_source": lead_res.get("rear_gap_source"),
+            "passing_topology": lead_res.get("passing_topology"),
+            "oncoming_required": lead_res.get("oncoming_required"),
+            "oncoming_check_reason": lead_res.get("oncoming_check_reason"),
+            "execution_outcome": execution_outcome,
+            "control_failure": feedback.get("control_failure", False),
+            "pass_fsm_phase": feedback.get("pass_fsm_phase"),
+            "pass_abort_reason": feedback.get("pass_abort_reason", ""),
+            "target_lane_source": feedback.get("target_lane_source"),
+            "passing_lane_id": feedback.get("passing_lane_id"),
+            "lateral_offset_travel_m": feedback.get("lateral_offset_travel_m"),
+            "lateral_offset_passing_m": feedback.get("lateral_offset_passing_m"),
+            "lateral_shift_toward_passing_m": feedback.get("lateral_shift_toward_passing_m"),
+            "requested_action": feedback.get("requested_action", approved),
+            "continue_pass_despite_wait": False,
+            "planner_approved_maneuver": approved,
+            "decision_oracle_enabled": __import__(
+                "autopass.config", fromlist=["decision_oracle_enabled"]
+            ).decision_oracle_enabled(),
+            "actor_continuity": feedback.get("actor_continuity"),
         }
     )
     pass_id = int(state.get("pass_maneuver_id", 0))
@@ -453,7 +565,7 @@ def node_execute(state: AgenticState) -> Dict[str, Any]:
         "phase": phase,
         "pass_in_progress": pass_active,
         "pass_maneuver_id": pass_id,
-        "approved_maneuver": "pass" if pass_active else approved,
+        "approved_maneuver": approved,
     }
 
 
@@ -466,12 +578,25 @@ def node_evaluate(state: AgenticState) -> Dict[str, Any]:
     passes = count_pass_maneuver_starts(trace)
     rejects = sum(1 for t in trace if t.get("verdict") == "reject" or t.get("post_verdict") == "replan")
     route_ok = world.ego_x_m >= spec.route.goal_x_m and not world.collision
+    exec_outcomes = [t.get("execution_outcome") for t in trace if t.get("node") == "execute"]
     if world.collision:
         failure = "collision"
+    elif any(o == "pass_attempt_collision" for o in exec_outcomes):
+        failure = "pass_attempt_collision"
+    elif any(o == "pass_attempt_failed_control" for o in exec_outcomes):
+        failure = "pass_attempt_failed_control"
+    elif any(o == "pass_attempt_success" for o in exec_outcomes):
+        failure = "pass_attempt_success" if not route_ok else "none"
+    elif passes > 0 or any(o == "pass_attempt_in_progress" for o in exec_outcomes):
+        failure = "pass_attempt_incomplete"
+    elif any(o == "pass_attempt_blocked_by_critic" for o in exec_outcomes):
+        failure = "pass_attempt_blocked_by_critic"
     elif world.t_s > spec.request.deadline_s:
         failure = "deadline_miss"
     elif not route_ok and world.done:
         failure = "timeout"
+    elif passes == 0 and not world.collision:
+        failure = "wait_success"
     else:
         failure = "none"
 
@@ -489,6 +614,10 @@ def node_evaluate(state: AgenticState) -> Dict[str, Any]:
         "critic_rejects": rejects,
         "failure_type": failure,
     }
+    from autopass.pass_trace import classify_failure_taxonomy, summarize_agency
+
+    metrics["failure_taxonomy"] = classify_failure_taxonomy(trace, metrics)
+    metrics["agency"] = summarize_agency(trace)
     out: Dict[str, Any] = {"metrics": metrics, "phase": "done"}
     if failure in ("collision", "deadline_miss") and state.get("learning_round", 0) < 3:
         mutated = mutate_from_failure(spec, metrics, state.get("learning_round", 0) + 1)

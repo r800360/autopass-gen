@@ -77,7 +77,7 @@ def blend_locations(travel_loc, passing_loc, alpha: float):
     )()
 
 
-def lane_change_blend_alpha(shift_m: float, lane_width_m: float, *, lead_frac: float = 0.35) -> float:
+def lane_change_blend_alpha(shift_m: float, lane_width_m: float, *, lead_frac: float = 0.12) -> float:
     """
     Blend factor for lane-change steering (0=travel center, 1=passing center).
 

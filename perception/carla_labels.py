@@ -23,8 +23,17 @@ def carla_seg_to_car_distances(seg: np.ndarray, depth_m: np.ndarray) -> List[Dic
         median_d = float(np.median(d_vals))
         cy = float(ys.mean())
         cx = float(xs.mean())
-        if cy > h * 0.55:
+        if cy > h * 0.50 and abs(cx - w * 0.5) < w * 0.22:
             position = "front"
+        elif cy > h * 0.55:
+            position = "front"
+        elif cy < h * 0.62 and median_d < 55.0:
+            if cx < w * 0.44:
+                position = "rear_left"
+            elif cx > w * 0.56:
+                position = "rear_right"
+            else:
+                position = "rear"
         elif cx < w * 0.45:
             position = "front_left"
         elif cx > w * 0.55:

@@ -9,8 +9,18 @@ def test_acc_brakes_at_critical_gap():
 
 
 def test_pass_waits_for_lateral_room():
-    assert resolve_pass_phase("pass", ego_lane=0, clear_of_lead=False, front_gap_m=10.0) == "approach"
+    assert resolve_pass_phase("pass", ego_lane=0, clear_of_lead=False, front_gap_m=10.0) == "lane_change"
     assert resolve_pass_phase("pass", ego_lane=0, clear_of_lead=False, front_gap_m=20.0) == "lane_change"
+    assert (
+        resolve_pass_phase(
+            "pass",
+            ego_lane=0,
+            clear_of_lead=False,
+            front_gap_m=10.0,
+            pass_fsm_phase="prepare_pass",
+        )
+        == "lane_change"
+    )
 
 
 def test_merge_only_when_clear():
@@ -40,6 +50,8 @@ def test_overtake_ignores_lateral_3d_gap_for_acc():
         speed_limit_mps=13.4,
         phase="overtake",
         longitudinal_lead_gap_m=5.0,
+        pass_fsm_phase="overtake",
+        pass_maneuver_started=True,
     )
     assert target >= 10.0
 
@@ -95,8 +107,10 @@ def test_wait_follow_uses_cruise_semantics_and_bounded_controls(monkeypatch):
         map=SimpleNamespace(),
         _last_steer=0.0,
         _last_control_debug={},
+        _travel_wp=wp,
         actors={"lead": None},
         lead_longitudinal_gap_m=lambda: 20.0,
+        get_travel_steering_waypoint=lambda ego, lookahead_m=None: wp,
         get_steering_waypoint=lambda ego, phase, passing_side: wp,
     )
     ego = _Ego()
@@ -117,3 +131,39 @@ def test_wait_follow_uses_cruise_semantics_and_bounded_controls(monkeypatch):
     assert -0.25 <= ctrl.steer <= 0.25
     assert 0.0 <= ctrl.throttle <= 0.72
     assert 0.0 <= ctrl.brake <= 0.9
+
+
+def test_near_miss_uses_longitudinal_gap_during_lateral_pass():
+    from types import SimpleNamespace
+    from perception.carla_control import _near_miss_this_step
+
+    lead = object()
+    session = SimpleNamespace(
+        ready=True,
+        actors={"lead": lead},
+        _longitudinal_along_travel=lambda other: 18.0 if other is lead else None,
+    )
+    pass_st = SimpleNamespace(active=True, phase="overtake")
+    assert (
+        _near_miss_this_step(
+            session,
+            4.5,
+            collision=False,
+            pass_st=pass_st,
+            ego_lane=1,
+            requested_action="pass",
+        )
+        is False
+    )
+    session._longitudinal_along_travel = lambda other: 5.0 if other is lead else None
+    assert (
+        _near_miss_this_step(
+            session,
+            4.5,
+            collision=False,
+            pass_st=pass_st,
+            ego_lane=1,
+            requested_action="pass",
+        )
+        is True
+    )

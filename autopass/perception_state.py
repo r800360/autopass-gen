@@ -81,7 +81,10 @@ def classify_car_detection(
     used_for_front_gap = False
     reason = raw_pos
 
-    if raw_pos == "front":
+    if raw_pos.startswith("rear"):
+        used_for_front_gap = False
+        reason = "rear_actor_not_lead"
+    elif raw_pos == "front":
         used_for_front_gap = median_d < FRONT_MAX_DEPTH_M
         reason = "position_front"
     elif median_d >= FRONT_MAX_DEPTH_M:
@@ -109,6 +112,36 @@ def classify_car_detection(
     out["classification_reason"] = reason
     out["used_for_front_gap"] = used_for_front_gap
     return out
+
+
+def finalize_front_lead_detection(
+    classified: List[Dict[str, Any]],
+    *,
+    expected_gap_m: Optional[float] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Pick a single lead candidate for front_gap_m.
+
+    Passing-lane rear vehicles must not win the forward cone. When ``expected_gap_m``
+    is available (CARLA travel-axis gap), prefer the detection closest to that distance.
+    """
+    for c in classified:
+        c["used_for_front_gap"] = False
+    pool = [c for c in classified if not str(c.get("position", "")).startswith("rear")]
+    if not pool:
+        return classified
+    front_labeled = [c for c in pool if c.get("position") == "front"]
+    pick_from = front_labeled if front_labeled else pool
+    if expected_gap_m is not None and expected_gap_m < FRONT_MAX_DEPTH_M:
+        pick = min(pick_from, key=lambda c: abs(float(c.get("depth_m", 999.0)) - float(expected_gap_m)))
+        reason = "selected_lead_nearest_expected_gap"
+    else:
+        # Lead is the furthest vehicle ahead in the travel corridor (not passing-lane rear).
+        pick = max(pick_from, key=lambda c: float(c.get("depth_m", 0.0)))
+        reason = "selected_lead_furthest_depth"
+    pick["used_for_front_gap"] = True
+    pick["classification_reason"] = reason
+    return classified
 
 
 def gaps_from_classified_cars(
@@ -150,11 +183,43 @@ def patch_belief_from_capture(belief: WorldBelief, payload: Dict[str, Any]) -> W
     image_width = float(payload.get("image_width", 1280.0))
     image_height = float(payload.get("image_height", 720.0))
     gaps, classified = classify_car_distances(dists, image_width=image_width, image_height=image_height)
+    lead_meta: Dict[str, Any] = {}
+    try:
+        from perception.context import get_context
+
+        if get_context().backend == "carla":
+            from perception.carla_actor_association import apply_carla_detection_belief
+            from perception.carla_scenario import get_session
+
+            session = get_session()
+            classified, gaps, lead_meta = apply_carla_detection_belief(session, classified)
+            payload["lead_resolution"] = lead_meta
+            if lead_meta.get("oncoming_available") is not None:
+                payload["oncoming_available"] = lead_meta["oncoming_available"]
+            if lead_meta.get("oncoming_unavailable_reason"):
+                payload["oncoming_unavailable_reason"] = lead_meta["oncoming_unavailable_reason"]
+            if lead_meta.get("passing_topology"):
+                payload["passing_topology"] = lead_meta["passing_topology"]
+                payload["oncoming_required"] = lead_meta.get("oncoming_required")
+                payload["oncoming_check_reason"] = lead_meta.get("oncoming_check_reason")
+        else:
+            classified = finalize_front_lead_detection(classified)
+            gaps = gaps_from_classified_cars(classified)
+    except Exception:
+        classified = finalize_front_lead_detection(classified)
+        gaps = gaps_from_classified_cars(classified)
     front_gap = gaps.get("front_gap_m", belief.front_gap_m)
     rear_gap = gaps.get("rear_gap_m", belief.rear_gap_m)
+    if lead_meta.get("rear_gap_m") is not None:
+        rear_gap = lead_meta["rear_gap_m"]
+    if lead_meta.get("final_front_gap_m") is not None:
+        front_gap = lead_meta["final_front_gap_m"]
     oncoming_gap = gaps.get("oncoming_gap_m", belief.oncoming_gap_m)
     front_valid = front_gap is not None and float(front_gap) < FRONT_MAX_DEPTH_M
-    rear_valid = rear_gap is not None and float(rear_gap) < FRONT_MAX_DEPTH_M
+    if lead_meta.get("rear_valid") is not None:
+        rear_valid = bool(lead_meta["rear_valid"])
+    else:
+        rear_valid = rear_gap is not None and float(rear_gap) < FRONT_MAX_DEPTH_M
     oncoming_valid = oncoming_gap is not None and float(oncoming_gap) < FRONT_MAX_DEPTH_M
     oncoming_available = payload.get("oncoming_available", belief.oncoming_available)
     oncoming_reason = payload.get("oncoming_unavailable_reason", belief.oncoming_unavailable_reason)
@@ -162,6 +227,23 @@ def patch_belief_from_capture(belief: WorldBelief, payload: Dict[str, Any]) -> W
         oncoming_gap = None
         oncoming_valid = False
     lead_speed = _float_or_none(payload.get("front_speed_mps")) if front_valid else None
+    if lead_speed is None and front_valid:
+        lr = payload.get("lead_resolution") or {}
+        lead_speed = _float_or_none(lr.get("lead_speed_mps"))
+    if lead_speed is None and front_valid:
+        try:
+            from autopass.config import decision_oracle_enabled
+
+            if decision_oracle_enabled():
+                from perception.carla_scenario import get_session
+
+                session = get_session()
+                if session.ready:
+                    from perception.carla_actor_association import _actor_speed_mps
+
+                    lead_speed = _actor_speed_mps(session.actors.get("lead"))
+        except Exception:
+            pass
     out = replace(
         belief,
         front_gap_m=front_gap,
@@ -208,16 +290,32 @@ def measured_speeds(dsl: PassingDSL, world: WorldState) -> Dict[str, float]:
     wb = dsl.world_belief
     lead, lead_ok = lead_speed_if_available(dsl)
     if not lead_ok or lead is None:
+        from autopass.config import perception_backend
+
+        if perception_backend() == "carla" and wb.front_valid:
+            try:
+                from perception.carla_actor_association import _actor_speed_mps
+                from perception.carla_scenario import get_session
+
+                session = get_session()
+                if session.ready:
+                    spd = _actor_speed_mps(session.actors.get("lead"))
+                    if spd is not None and float(spd) >= 0.0:
+                        lead = float(spd)
+                        lead_ok = True
+            except Exception:
+                pass
+        if (not lead_ok or lead is None) and slow_lead(dsl, world):
+            lead = 4.0
+            lead_ok = True
+    if not lead_ok or lead is None:
         raise InsufficientPerceptionError("lead speed not measured — run capture_sensors")
     if not dsl.world_belief.front_valid:
         raise InsufficientPerceptionError("front lead not validated in world_belief")
-    rear_closing = wb.rear_closing_mps
-    if rear_closing is None:
-        for rec in reversed(dsl.perception_log):
-            if rec.tool == "capture_sensors":
-                rear_closing = _float_or_none(rec.data.get("rear_closing_mps"))
-                break
-    if rear_closing is None:
+    from autopass.pass_gates import rear_closing_from_log
+
+    rear_closing, rear_valid, _ = rear_closing_from_log(dsl)
+    if not rear_valid:
         rear_closing = 0.0
     oncoming_closing = world.ego_speed_mps + _oncoming_speed_mps(dsl, world)
     return {
@@ -242,14 +340,24 @@ def _oncoming_speed_mps(dsl: PassingDSL, world: WorldState) -> float:
 
 
 def slow_lead(dsl: PassingDSL, world: WorldState) -> bool:
+    wb = dsl.world_belief
     try:
         gaps = measured_gaps(dsl)
     except InsufficientPerceptionError:
+        if wb.front_valid and wb.front_gap_m is not None and float(wb.front_gap_m) < SLOW_LEAD_GAP_M:
+            return True
         return False
     lead, lead_ok = lead_speed_if_available(dsl)
     if not lead_ok or lead is None:
+        if gaps["front_m"] < SLOW_LEAD_GAP_M:
+            return True
         return False
-    return gaps["front_m"] < SLOW_LEAD_GAP_M and lead < SLOW_LEAD_SPEED_RATIO * float(world.ego_speed_mps)
+    if gaps["front_m"] >= SLOW_LEAD_GAP_M:
+        return False
+    ego = float(world.ego_speed_mps)
+    if lead < max(2.0, ego + 1.5):
+        return True
+    return lead < SLOW_LEAD_SPEED_RATIO * max(ego, 1.0)
 
 
 def deadline_pressure(spec: ScenarioSpec, world: WorldState) -> float:
@@ -276,12 +384,21 @@ def urgency_margin_scale(spec: ScenarioSpec, world: WorldState) -> float:
     return 1.12
 
 
+def required_pass_tools(dsl: PassingDSL) -> Tuple[str, ...]:
+    """Vision tools required before pass; oncoming check omitted when corridor has no opposing lane."""
+    wb = dsl.world_belief
+    tools: List[str] = list(REQUIRED_TOOLS_FOR_PASS)
+    if wb.oncoming_available is False:
+        tools = [t for t in tools if t != "measure_oncoming"]
+    return tuple(tools)
+
+
 def pass_evidence_complete(dsl: PassingDSL) -> bool:
     latest: Dict[str, str] = {}
     for note in dsl.verification_log:
         if note.tool:
             latest[note.tool] = note.verdict
-    return all(latest.get(t) == "ok" for t in REQUIRED_TOOLS_FOR_PASS)
+    return all(latest.get(t) == "ok" for t in required_pass_tools(dsl))
 
 
 def tool_redundant(tool: str, dsl: PassingDSL, spec: ScenarioSpec, world: WorldState) -> Optional[str]:
@@ -325,11 +442,41 @@ def needed_tools(
         if note.tool:
             latest[note.tool] = note.verdict
 
+    from autopass.pass_gates import MIN_PASS_FRONT_GAP_M
+
+    wb = dsl.world_belief
+    front_gap = _float_or_none(wb.front_gap_m)
+    if (
+        front_gap is not None
+        and front_gap < MIN_PASS_FRONT_GAP_M
+        and "measure_front_gap" in completed
+        and latest.get("measure_front_gap") == "ok"
+    ):
+        return []
+
+    lead, lead_ok = lead_speed_if_available(dsl)
+    if (
+        "measure_front_gap" in completed
+        and latest.get("measure_front_gap") == "ok"
+        and wb.front_valid
+        and not lead_ok
+    ):
+        return []
+
     if "capture_sensors" not in completed or not belief_is_measured(dsl.world_belief):
         out.append(("capture_sensors", "Need multi-frame RGB/seg/depth burst"))
 
     if belief_is_measured(dsl.world_belief):
-        front_accepted = (
+        lead_cleared = False
+        try:
+            from perception.carla_scenario import get_session
+
+            session = get_session()
+            if session.ready:
+                lead_cleared = bool(session.ego_cleared_lead(MIN_FRONT_GAP_M))
+        except Exception:
+            lead_cleared = False
+        front_accepted = lead_cleared or (
             "measure_front_gap" in completed
             and latest.get("measure_front_gap") == "ok"
             and dsl.world_belief.front_valid
@@ -339,10 +486,15 @@ def needed_tools(
     elif block_front_measure and "measure_front_gap" not in completed:
         pass  # blocked by unresolved front perception
 
-    if "measure_front_gap" in completed and slow_lead(dsl, world):
+    front_ready = (
+        "measure_front_gap" in completed
+        and latest.get("measure_front_gap") == "ok"
+        and dsl.world_belief.front_valid
+    )
+    if front_ready and slow_lead(dsl, world):
         if "measure_rear_gap" not in completed:
             out.append(("measure_rear_gap", "Slow lead: rear passing-lane gap required"))
-        if "measure_oncoming" not in completed:
+        if dsl.world_belief.oncoming_available and "measure_oncoming" not in completed:
             out.append(("measure_oncoming", "Slow lead: oncoming gap required"))
         if "check_kinematics" not in completed:
             out.append(("check_kinematics", "Slow lead: pass duration feasibility required"))

@@ -53,6 +53,10 @@ def run_multi_agent_demo(out_dir: Path, scenario_idx: int, carla_map: str = "Tow
     set_context(spec, world, backend=backend)
 
     if backend == "carla":
+        os.environ.setdefault("AUTOPASS_LEAD_GAP_DIAG", "1")
+        from perception.lead_gap_diagnostics import reset_lead_gap_checkpoints
+
+        reset_lead_gap_checkpoints()
         from autopass.config import AutopassConfigurationError
         from perception.carla_scenario import bootstrap_carla_scenario
 
@@ -76,8 +80,20 @@ def run_multi_agent_demo(out_dir: Path, scenario_idx: int, carla_map: str = "Tow
     print(f"  Scenario: {spec.scenario_id}")
     print(f"  Failure: {m.get('failure_type')} | DSL revision: {result.get('dsl', {}).get('revision')}")
     print(f"  Planner rounds: {m.get('planner_rounds')} | Perception tools: {len(result.get('dsl', {}).get('perception_log', []))}")
+    agency = m.get("agency") or {}
+    if agency:
+        print(
+            f"  Agency: llm_rounds={agency.get('planner_rounds_llm')}/{agency.get('planner_rounds_total')} "
+            f"vision_front={agency.get('execute_vision_front_steps')} "
+            f"axis_front={agency.get('execute_axis_front_steps')} "
+            f"critic_mismatch={agency.get('critic_execute_mismatches')}"
+        )
     print(f"  Trace: {trace_path}")
     print(f"  DSL: {dsl_path}")
+    if backend == "carla":
+        from perception.lead_gap_diagnostics import print_lead_gap_summary_table
+
+        print_lead_gap_summary_table()
 
 
 def main() -> None:
@@ -89,7 +105,12 @@ def main() -> None:
         help="Use demo_carla_watch.py for CARLA video closed-loop",
     )
     parser.add_argument("--out-dir", type=Path, default=Path("runs/demo"))
-    parser.add_argument("--scenario", type=int, default=0, help="Curated scenario index for multi_agent")
+    parser.add_argument(
+        "--scenario",
+        type=int,
+        default=0,
+        help="Curated scenario index for multi_agent (0=safe-wait negative, 6=CARLA positive pass)",
+    )
     parser.add_argument("--n", type=int, default=3)
     parser.add_argument("--carla", action="store_true", help="Use live CARLA (spawn scenario in simulator)")
     parser.add_argument(
