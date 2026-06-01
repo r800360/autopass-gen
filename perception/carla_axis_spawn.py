@@ -46,6 +46,30 @@ def projected_distance_m(
     return dx * t[0] + dy * t[1] + dz * t[2]
 
 
+def lateral_lane_center_correction(
+    axis_xyz: Tuple[float, float, float],
+    lane_center_xyz: Tuple[float, float, float],
+    lateral_dir: Tuple[float, float, float],
+    travel_dir: Tuple[float, float, float],
+) -> Tuple[float, float, float]:
+    """
+    Shift ``axis_xyz`` along the passing-lane lateral axis to match lane center.
+    Preserves longitudinal position along travel (unlike raw get_waypoint snap).
+    """
+    lat_u = normalize3(lateral_dir)
+    if math.hypot(lat_u[0], lat_u[1]) < 0.05:
+        t = normalize3(travel_dir)
+        lat_u = (-t[1], t[0], 0.0)
+    lat_comp = (lane_center_xyz[0] - axis_xyz[0]) * lat_u[0] + (
+        lane_center_xyz[1] - axis_xyz[1]
+    ) * lat_u[1]
+    return (
+        axis_xyz[0] + lat_u[0] * lat_comp,
+        axis_xyz[1] + lat_u[1] * lat_comp,
+        axis_xyz[2],
+    )
+
+
 def euclidean_distance_m(
     a: Tuple[float, float, float],
     b: Tuple[float, float, float],

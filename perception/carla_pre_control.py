@@ -86,6 +86,19 @@ def pre_control_diagnostic(session, *, for_follow_lead: bool = True) -> Dict[str
     if lead_signed is not None:
         out["lead_abs_gap_m"] = round(max(0.0, float(lead_signed)), 3)
 
+    lead = session.actors.get("lead") if session.actors else None
+    if lead is not None and session.map is not None:
+        try:
+            lead_loc = lead.get_location()
+            lead_wp = session.map.get_waypoint(lead_loc, project_to_road=True)
+            out["lead_lane_center_error_m"] = round(
+                lane_center_distance_m(lead_loc, lead_wp), 3
+            )
+            out["lead_lane_id"] = int(lead_wp.lane_id)
+            out["lead_road_id"] = int(lead_wp.road_id)
+        except Exception:
+            pass
+
     if hasattr(session, "route_cursor_debug_snapshot"):
         out["route_cursor"] = session.route_cursor_debug_snapshot(ego)
     if hasattr(session, "geometry_debug_snapshot"):
@@ -196,6 +209,7 @@ def log_pre_control_diagnostic(session, *, for_follow_lead: bool = True) -> Dict
         "target_lane_id",
         "yaw_error_deg",
         "lane_center_error_m",
+        "lead_lane_center_error_m",
         "heading_error_deg",
         "lead_signed_gap_m",
         "rear_signed_gap_m",

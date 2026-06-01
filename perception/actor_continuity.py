@@ -48,6 +48,10 @@ def allows_pre_decision_actor_layout(session) -> bool:
 
 def mark_closed_loop_actuation_begun(session) -> None:
     """Mark closed-loop actuation; snapshot lead pose once (never refresh on later executes)."""
+    # Pre-actuation layout snaps (burst restore, first-execute convoy finalize) set these flags;
+    # they must not count as violations once closed-loop actuation starts.
+    session._last_layout_transform_applied = False
+    session._last_layout_transform_reason = None
     already = bool(getattr(session, "_closed_loop_actuation_begun", False))
     session._closed_loop_actuation_begun = True
     if already and getattr(session, "_actuation_hold_lead_transform", None) is not None:

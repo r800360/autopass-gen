@@ -57,6 +57,24 @@ def test_enable_ego_physics_turns_on_ego_only():
     assert session._ego_physics is True
 
 
+def test_enable_ego_physics_does_not_re_snap_when_already_on():
+    from unittest.mock import MagicMock
+
+    session = CarlaScenarioSession()
+    session.ready = True
+    session.world = MagicMock()
+    session.actors["ego"] = _FakeEgo()
+    session.snap_ego_to_travel_pose = MagicMock(return_value=True)
+    session.align_ego_to_travel_lane = MagicMock(return_value=False)
+    session._ensure_spawn_gaps = MagicMock()
+
+    session.enable_ego_physics(True)
+    session.enable_ego_physics(True)
+
+    session.snap_ego_to_travel_pose.assert_called_once()
+    session._ensure_spawn_gaps.assert_called_once()
+
+
 def test_enable_ego_physics_requires_client_when_not_ready():
     session = CarlaScenarioSession()
     session.world = object()

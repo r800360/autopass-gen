@@ -184,6 +184,9 @@ def abort_pass(session, reason: str) -> PassControlState:
 def check_multi_lane_departure(session, ego) -> Tuple[bool, str]:
     d_travel, d_pass, width = _lane_offsets_m(session, ego)
     fail_m = max(lane_departure_fail_m(), width * MULTI_LANE_FAIL_MULT)
+    st = get_pass_control_state(session)
+    if st.active and st.phase in ("lane_change", "overtake") and st.maneuver_started:
+        fail_m = max(fail_m, width * 2.15, 7.5)
     if min(d_travel, d_pass) > fail_m:
         return True, f"multi_lane_departure travel={d_travel:.2f}m pass={d_pass:.2f}m"
     if d_travel > width * 2.2 and d_pass > width * 2.2:

@@ -9,6 +9,7 @@ import pytest
 
 from perception.carla_axis_spawn import (
     euclidean_distance_m,
+    lateral_lane_center_correction,
     projected_distance_m,
     world_location_from_ego_offset,
 )
@@ -24,6 +25,23 @@ def test_world_location_lead_32m_ahead_of_ego():
     assert lead[0] == pytest.approx(-485.2, abs=0.5)
     assert lead[1] == pytest.approx(165.0, abs=0.5)
     assert lead != (5.0, -32.0, 0.0)
+
+
+def test_lateral_lane_center_correction_preserves_longitudinal():
+    ego = (-486.0, 197.0, 0.0)
+    travel = (0.0242, -0.9997, 0.0)
+    lateral = (-0.9997, -0.0241, 0.0)
+    axis_pt = world_location_from_ego_offset(ego, travel, lateral, longitudinal_m=32.0, lateral_m=0.0)
+    # Lane center 1.2m to the left of axis point (along +lateral)
+    center = (
+        axis_pt[0] + 1.2 * lateral[0],
+        axis_pt[1] + 1.2 * lateral[1],
+        axis_pt[2],
+    )
+    corrected = lateral_lane_center_correction(axis_pt, center, lateral, travel)
+    proj = projected_distance_m(ego, corrected, travel)
+    assert proj == pytest.approx(32.0, abs=0.05)
+    assert euclidean_distance_m(axis_pt, corrected) == pytest.approx(1.2, abs=0.05)
 
 
 def test_projected_distance_matches_requested_longitudinal():
@@ -130,6 +148,96 @@ def test_spawn_profile_enables_axis_for_demo_07():
     profile = CarlaScenarioSession._spawn_profile(spec)
     assert profile["axis_spawn"] is True
     assert profile["lead_gap_m"] == 32.0
+    assert profile["lead_speed_mps"] == 0.0
+
+
+def test_stationary_lead_does_not_creep_on_zero_speed_axis_step():
+    class _Carla:
+        class Location:
+            def __init__(self, x, y, z):
+                self.x, self.y, self.z = x, y, z
+
+        class Rotation:
+            yaw = -88.0
+            pitch = roll = 0.0
+
+        class Transform:
+            def __init__(self, loc, rot=None):
+                self.location = loc
+                self.rotation = rot or _Carla.Rotation()
+
+    class _Lead:
+        def __init__(self):
+            self._loc = _Carla.Location(-486.0, 165.0, 0.3)
+
+        def get_location(self):
+            return self._loc
+
+        def get_transform(self):
+            return _Carla.Transform(self._loc)
+
+        def set_transform(self, tf):
+            self._loc = tf.location
+
+    session = CarlaScenarioSession.__new__(CarlaScenarioSession)
+    session.carla = _Carla
+    session._travel_wp = SimpleNamespace(
+        transform=SimpleNamespace(
+            location=_Carla.Location(-486.0, 197.0, 0.0),
+            rotation=_Carla.Rotation(),
+        )
+    )
+    session._axis_travel_dir = (0.0, -1.0, 0.0)
+    session._axis_ego_xyz = (-486.0, 197.0, 0.3)
+    session._axis_lateral_dir = (0.0, 0.0, 0.0)
+    session.actors = {"lead": _Lead()}
+    spec = curated_demo_scenarios()[6]
+    before = session.actors["lead"].get_location().y
+    session._step_actor_along_travel_axis("lead", 0.0, 0.05)
+    after = session.actors["lead"].get_location().y
+    assert after == pytest.approx(before, abs=1e-6)
+
+
+def test_fixed_corridor_origin_advances_ego_s_along_axis():
+    """Lane anchors must use spawn origin, not live ego (ego_s would stay ~0)."""
+    class _Carla:
+        class Location:
+            def __init__(self, x, y, z):
+                self.x, self.y, self.z = x, y, z
+
+        class Rotation:
+            def __init__(self, pitch=0.0, yaw=-88.0, roll=0.0):
+                self.pitch, self.yaw, self.roll = pitch, yaw, roll
+
+        class Transform:
+            def __init__(self, location, rotation):
+                self.location = location
+                self.rotation = rotation
+
+    class _Ego:
+        def __init__(self, x, y, z=0.3):
+            self._loc = _Carla.Location(x, y, z)
+            self._rot = _Carla.Rotation()
+
+        def get_transform(self):
+            return _Carla.Transform(self._loc, self._rot)
+
+        def get_location(self):
+            return self._loc
+
+    session = CarlaScenarioSession.__new__(CarlaScenarioSession)
+    session.carla = _Carla
+    session.map = SimpleNamespace()
+    session._passing_wp = None
+    session._passing_side = "left"
+    session._axis_spawn_active = True
+    session._corridor_axis_origin_xyz = (-486.0, 197.0, 0.3)
+    session._axis_travel_dir = (0.0242, -0.9997, 0.0)
+    session._travel_wp = _mock_travel_waypoint_chain(_Carla, origin_y=197.0)
+    ego = _Ego(-486.0, 190.0)
+    session.actors = {"ego": ego}
+    s = session.project_actor_along_travel_axis("ego")
+    assert s == pytest.approx(7.0, abs=0.6)
 
 
 def test_spawn_profile_default_uses_waypoint_cap():
