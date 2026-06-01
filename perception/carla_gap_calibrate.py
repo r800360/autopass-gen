@@ -16,4 +16,7 @@ def calibrate_front_gap_m(depth_gap_m: float, session) -> float:
         return depth_gap_m
     if abs(travel - depth_gap_m) <= CALIBRATE_DEPTH_MISMATCH_M:
         return depth_gap_m
+    # Beside the lead during a pass, depth is moderately shorter than axis; huge under-reads stay axis.
+    if depth_gap_m < travel and depth_gap_m >= travel * 0.45:
+        return depth_gap_m
     return travel

@@ -216,11 +216,19 @@ def finalize_post_step_belief(
 
     if (pass_active or cleared_lead) and prior.front_valid and prior.front_gap_m is not None:
         obs_front = out.front_gap_m
+        closing = (
+            obs_front is not None
+            and out.front_valid
+            and float(obs_front) < float(prior.front_gap_m) - 1.5
+        )
         outlier = (
             obs_front is None
             or not out.front_valid
             or float(obs_front) >= 120.0
-            or abs(float(obs_front) - float(prior.front_gap_m)) > 45.0
+            or (
+                not closing
+                and abs(float(obs_front) - float(prior.front_gap_m)) > 45.0
+            )
         )
         if outlier:
             out = replace(
@@ -234,6 +242,21 @@ def finalize_post_step_belief(
     if out.lead_speed_mps is None and prior.lead_speed_mps is not None:
         out = replace(out, lead_speed_mps=prior.lead_speed_mps)
     lr = payload.get("lead_resolution") or {}
+    axis_gap = lr.get("lead_axis_gap_m")
+    if (pass_active or cleared_lead) and (
+        not out.front_valid or out.front_gap_m is None or float(out.front_gap_m) >= 200.0
+    ):
+        try:
+            ag = float(axis_gap)
+            if 5.0 <= ag <= 60.0:
+                out = replace(
+                    out,
+                    front_gap_m=ag,
+                    front_valid=True,
+                )
+                payload["belief_axis_fallback_during_pass"] = True
+        except (TypeError, ValueError):
+            pass
     if out.lead_speed_mps is None and lr.get("lead_speed_mps") is not None:
         out = replace(out, lead_speed_mps=float(lr["lead_speed_mps"]))
     if out.rear_closing_mps is None and prior.rear_closing_mps is not None:

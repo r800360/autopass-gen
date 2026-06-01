@@ -1,6 +1,6 @@
 from autopass.critic import critique_maneuver_proposal, critique_tool_result
 from autopass.dsl import init_dsl_from_request
-from autopass.planner import plan_next
+from autopass.planner import PlannerDecision, _clamp_maneuver_during_pass, plan_next
 from autopass.tools import run_tool
 from visual_world import curated_demo_scenarios, initialize_world
 
@@ -21,6 +21,27 @@ def test_planner_requests_capture_sensors_first():
     assert decision.action == "run_tool"
     assert decision.tool == "capture_sensors"
     assert "burst" in decision.reasoning.lower() or "frame" in decision.reasoning.lower() or "Need" in decision.reasoning
+
+
+def test_clamp_maneuver_during_pass_converts_abort_to_continue():
+    abort = PlannerDecision(
+        action="decide_maneuver",
+        maneuver="abort_pass",
+        reasoning="Front gap below threshold.",
+    )
+    out = _clamp_maneuver_during_pass(abort, pass_in_progress=True)
+    assert out.maneuver == "pass"
+
+
+def test_clamp_maneuver_during_pass_forces_continue_pass():
+    wait_decision = PlannerDecision(
+        action="decide_maneuver",
+        maneuver="wait",
+        reasoning="Front gap below 18m.",
+    )
+    out = _clamp_maneuver_during_pass(wait_decision, pass_in_progress=True)
+    assert out.maneuver == "pass"
+    assert _clamp_maneuver_during_pass(wait_decision, pass_in_progress=False).maneuver == "wait"
 
 
 def test_planner_does_not_pass_under_low_urgency():

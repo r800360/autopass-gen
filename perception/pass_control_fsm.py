@@ -12,6 +12,7 @@ from typing import Any, Dict, Literal, Optional, Tuple
 from autopass.carla_tuning import (
     critical_gap_m,
     lane_departure_fail_m,
+    merge_clear_m,
     pass_lateral_min_m,
     safe_follow_m,
 )
@@ -187,6 +188,8 @@ def check_multi_lane_departure(session, ego) -> Tuple[bool, str]:
     st = get_pass_control_state(session)
     if st.active and st.phase in ("lane_change", "overtake") and st.maneuver_started:
         fail_m = max(fail_m, width * 2.15, 7.5)
+    if st.active and st.phase == "merge_back":
+        fail_m = max(fail_m, width * 2.55, 9.0)
     if min(d_travel, d_pass) > fail_m:
         return True, f"multi_lane_departure travel={d_travel:.2f}m pass={d_pass:.2f}m"
     if d_travel > width * 2.2 and d_pass > width * 2.2:
@@ -248,9 +251,17 @@ def advance_pass_fsm(
                 ego_on_passing = int(ego_wp.lane_id) == int(st.passing_lane_id)
         except Exception:
             ego_on_passing = on_pass
-        centered = ego_on_passing and on_pass and d_pass < 0.85
-        shifted = ego_on_passing and (d_pass < width * 0.75 or shift >= width * 0.35)
-        lateral_progress = shift >= width * 0.28 or d_travel >= width * 0.32
+        head_aligned = True
+        if hasattr(session, "heading_error_to_passing_lane_deg"):
+            try:
+                head_aligned = abs(float(session.heading_error_to_passing_lane_deg(ego))) < 20.0
+            except Exception:
+                head_aligned = True
+        centered = (
+            d_pass < width * 0.36 and shift >= width * 0.56 and head_aligned
+        )
+        shifted = d_pass < width * 0.40 and shift >= width * 0.58 and head_aligned
+        lateral_progress = shift >= width * 0.30 or d_travel >= width * 0.34
         if lateral_progress:
             st.maneuver_started = True
         if centered or shifted:
@@ -264,10 +275,15 @@ def advance_pass_fsm(
     if st.phase == "overtake":
         long_cleared = clear_of_lead
         if hasattr(session, "ego_cleared_lead"):
-            from autopass.carla_tuning import merge_clear_m
-
             long_cleared = bool(session.ego_cleared_lead(merge_clear_m()))
-        if long_cleared and ego_on_passing_lane(session, ego, st) and (on_pass or d_pass < width * 0.85):
+        # Merge only after longitudinal clearance AND centered on passing lane (vision/geometry).
+        merge_ready = (
+            long_cleared
+            and st.maneuver_started
+            and d_pass < width * 0.36
+            and shift >= width * 0.56
+        )
+        if merge_ready:
             st.phase = "merge_back"
             st.ticks_in_phase = 0
             st.target_lane_source = "return_lane"
@@ -276,16 +292,25 @@ def advance_pass_fsm(
         return st
 
     if st.phase == "merge_back":
-        tw = session._travel_wp
-        if tw is not None and ego is not None:
+        if d_pass > width * 0.42 or shift < width * 0.48:
+            st.phase = "overtake"
+            st.ticks_in_phase = 0
+            st.target_lane_source = "passing_lane"
+            return st
+        long_cleared = clear_of_lead
+        if hasattr(session, "ego_cleared_lead"):
+            long_cleared = bool(session.ego_cleared_lead(merge_clear_m()))
+        head_ok = True
+        if hasattr(session, "heading_error_to_travel_lane_deg"):
             try:
-                ego_wp = session.map.get_waypoint(ego.get_location(), project_to_road=True)
-                on_travel = ego_wp.road_id == tw.road_id and ego_wp.lane_id == tw.lane_id
+                head_ok = abs(float(session.heading_error_to_travel_lane_deg(ego))) < 22.0
             except Exception:
-                on_travel = False
-        else:
-            on_travel = False
-        if clear_of_lead and on_travel and d_travel < 0.7:
+                head_ok = True
+        aligned = d_travel < 0.65 and head_ok
+        if (clear_of_lead or long_cleared) and aligned:
+            st.active = False
+            st.phase = "idle"
+        elif st.ticks_in_phase > 200 and d_travel < 0.85 and head_ok:
             st.active = False
             st.phase = "idle"
         return st
@@ -310,12 +335,36 @@ def pass_control_tick(
     """
     st = get_pass_control_state(session)
 
+    width = session.expected_passing_lane_width_m() if hasattr(session, "expected_passing_lane_width_m") else 3.5
+    shift = (
+        float(session.lateral_shift_toward_passing_m(ego))
+        if ego is not None and hasattr(session, "lateral_shift_toward_passing_m")
+        else 0.0
+    )
+    long_gap = front_gap_m
+    if hasattr(session, "lead_longitudinal_gap_m"):
+        try:
+            long_gap = float(session.lead_longitudinal_gap_m())
+        except Exception:
+            pass
+
     if requested_action in ("wait", "follow_lead") and pass_in_progress and st.active:
+        lateral_commit = st.maneuver_started or shift >= width * 0.12
+        if st.phase in ("lane_change", "overtake", "merge_back"):
+            if long_gap < critical_gap_m():
+                abort_pass(session, f"planner_wait_critical_gap_{long_gap:.1f}m")
+                return st, "wait", True
+            if lateral_commit:
+                if not st.maneuver_started:
+                    st.maneuver_started = True
+                return st, "pass", False
         if st.phase in ("prepare_pass", "lane_change") and not st.maneuver_started:
+            if shift >= width * 0.12:
+                st.maneuver_started = True
+                return st, "pass", False
             abort_pass(session, "planner_requested_wait_early_abort")
             return st, "wait", False
         if st.maneuver_started and st.phase in ("lane_change", "overtake", "merge_back"):
-            # Hysteresis: committed pass — hold maneuver until complete or hard abort.
             return st, "pass", False
         if st.phase in ("prepare_pass", "lane_change"):
             abort_pass(session, "planner_requested_wait_abort_to_travel")

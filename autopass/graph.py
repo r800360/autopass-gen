@@ -408,7 +408,9 @@ def node_execute(state: AgenticState) -> Dict[str, Any]:
     elif pass_active and approved == "abort_pass":
         action = "wait"
     elif pass_active and approved == "wait":
-        action = "wait"
+        if state.get("proposed_maneuver") != "abort_pass":
+            # Executor FSM completes the maneuver; mid-pass wait would steer toward travel lane.
+            action = "pass"
     maneuver_started = False
 
     world_before = world

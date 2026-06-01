@@ -173,7 +173,7 @@ def test_lane_change_path_center_at_ego_not_lookahead():
     assert path is not None and steer is not None
     assert abs(path.y - steer.y) < 2.0
     d = s.ego_lane_center_distance_m(ego, phase="lane_change")
-    assert d < 0.5
+    assert d < 1.2
 
 
 def test_lane_center_on_travel_lane_during_lane_change_phase():

@@ -19,6 +19,9 @@ for i, e in enumerate(execs):
     print(
         f"exec{i} action={e.get('action', fb.get('action'))} "
         f"step={fb.get('episode_step')} "
+        f"dt={fb.get('duration_s')} "
+        f"ticks={fb.get('control_ticks')} "
+        f"head={fb.get('heading_error_deg')} "
         f"lane_center={fb.get('lane_center_error_m')} "
         f"lat_steer={fb.get('lateral_error_m')} "
         f"max_lane={fb.get('max_lane_center_dist_m')} "
@@ -26,7 +29,10 @@ for i, e in enumerate(execs):
         f"ego_spd={fb.get('ego_speed_mps')} "
         f"viol={ac.get('continuity_violations')} "
         f"ego_d={ac.get('delta_ego_world_m')} "
-        f"lead_d={ac.get('delta_lead_world_m')}"
+        f"lead_d={ac.get('delta_lead_world_m')} "
+        f"fsm={fb.get('pass_fsm_phase')} "
+        f"d_pass={fb.get('lateral_offset_passing_m')} "
+        f"shift={fb.get('lateral_shift_toward_passing_m')}"
     )
 print("\n--- tools with lead restore/reset ---")
 for e in t:

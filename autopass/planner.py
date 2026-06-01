@@ -61,6 +61,35 @@ def _clamp_pass_decision(
     return PlannerDecision(action="decide_maneuver", maneuver="wait", reasoning=reason)
 
 
+def _clamp_maneuver_during_pass(
+    decision: PlannerDecision,
+    *,
+    pass_in_progress: bool,
+) -> PlannerDecision:
+    """Mid-pass: front-gap gate applies before starting pass, not while finishing beside the lead."""
+    if not pass_in_progress or decision.action != "decide_maneuver":
+        return decision
+    if decision.maneuver == "pass":
+        return decision
+    if decision.maneuver == "abort_pass":
+        return PlannerDecision(
+            action="decide_maneuver",
+            maneuver="pass",
+            reasoning=(
+                "Pass in progress — closing front gap is expected beside the lead; "
+                "finish the lane change and merge-back (do not abort for sub-18m vision alone)."
+            ),
+        )
+    return PlannerDecision(
+        action="decide_maneuver",
+        maneuver="pass",
+        reasoning=(
+            "Pass in progress — continue actuation until merge-back completes "
+            "(closing front gap is expected; do not wait mid-maneuver)."
+        ),
+    )
+
+
 def _rule_plan(
     dsl: PassingDSL,
     spec: ScenarioSpec,
@@ -124,6 +153,7 @@ def plan_next(
 
     if dsl.mission.aggression == "0" and decision.maneuver == "pass":
         return PlannerDecision(action="decide_maneuver", maneuver="wait", reasoning="No-pass policy.")
+    decision = _clamp_maneuver_during_pass(decision, pass_in_progress=pass_in_progress)
     return _clamp_pass_decision(decision, dsl, spec, world)
 
 
@@ -217,7 +247,8 @@ def _llm_decide_maneuver(
         f"Perception summary: {summary}\n"
         f"Choose action=decide_maneuver and maneuver one of {allowed}. "
         f"Propose pass only when can_pass is true. If pass in progress and rear/oncoming unsafe, abort_pass. "
-        f"Under high urgency prefer pass when gates allow; when can_pass is false, wait or run tools next cycle."
+        f"If pass_in_progress is true, you MUST choose maneuver=pass (never wait/replan) unless aborting. "
+        f"Under high urgency prefer pass when gates allow; when can_pass is false and pass not in progress, wait or run tools."
     )
     decision = structured_invoke(
         PlannerDecision,

@@ -84,7 +84,9 @@ def run_segmentation(rgb_image: np.ndarray) -> dict:
     if ctx.backend == "carla" and ctx.spec is not None and ctx.world is not None:
         rgb, seg, depth_m = _acquire_frame(ctx.spec, ctx.world)
         from perception.carla_labels import carla_seg_to_car_distances
+        from perception.lane_marking_vision import analyze_lane_markings_under_ego
 
+        lane_hint = analyze_lane_markings_under_ego(seg)
         car_masks = []
         for c in carla_seg_to_car_distances(seg, depth_m):
             x0, y0, x1, y1 = c["bbox"]
@@ -93,9 +95,10 @@ def run_segmentation(rgb_image: np.ndarray) -> dict:
             car_masks.append({"bbox": c["bbox"], "mask": m, "confidence": 0.9, "label": "car"})
         return {
             "car_masks": car_masks,
-            "lane_lines": [],
+            "lane_lines": [lane_hint] if lane_hint.get("center_line_under_ego") else [],
             "hazards": [],
             "drivable_area": np.isin(seg, [7, 8]).astype(np.uint8),
+            "lane_marking_hint": lane_hint,
         }
     if ctx.spec is not None and ctx.world is not None:
         _, seg, _ = _acquire_frame(ctx.spec, ctx.world)

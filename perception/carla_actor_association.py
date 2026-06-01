@@ -124,14 +124,12 @@ def annotate_detections_with_actors(
     return classified
 
 
-def _lead_on_travel_lane(session, axis: Dict[str, Any]) -> bool:
-    ego_lane = axis.get("ego_lane_id")
+def _lead_actor_on_travel_lane(session, axis: Dict[str, Any]) -> bool:
+    """Lead on the spawn travel lane (ego may be on the adjacent passing lane mid-pass)."""
     lead_lane = axis.get("lead_lane_id")
     tw = getattr(session, "_travel_wp", None)
-    if ego_lane is not None and lead_lane is not None and tw is not None:
-        return int(ego_lane) == int(lead_lane) == int(tw.lane_id)
-    if ego_lane is not None and lead_lane is not None:
-        return int(ego_lane) == int(lead_lane)
+    if lead_lane is not None and tw is not None:
+        return int(lead_lane) == int(tw.lane_id)
     return True
 
 
@@ -163,6 +161,22 @@ def _vision_front_pool(classified: List[Dict[str, Any]], *, max_depth_m: float =
         elif pos == "front" or c.get("used_for_front_gap"):
             pool.append(c)
     return pool
+
+
+def _pick_vision_front_detection(
+    session,
+    vision_pool: List[Dict[str, Any]],
+    *,
+    lead_axis: float,
+) -> Dict[str, Any]:
+    """Closest credible lead among forward detections (never the farthest blob)."""
+    lead_matched = [c for c in vision_pool if c.get("matched_actor") == "lead"]
+    pool = lead_matched if lead_matched else vision_pool
+    if not pool:
+        raise ValueError("empty vision_pool")
+    if lead_axis < LEAD_AXIS_MAX_M:
+        return min(pool, key=lambda c: abs(float(c.get("depth_m", c.get("median_depth", 999.0))) - lead_axis))
+    return min(pool, key=lambda c: float(c.get("depth_m", c.get("median_depth", 999.0))))
 
 
 def _visual_lead_candidates(
@@ -272,11 +286,11 @@ def resolve_lead_front_gap(
 
     lead_axis = float(axis["lead_axis_gap_m"])
     lead_ok = LEAD_AXIS_MIN_M <= lead_axis <= LEAD_AXIS_MAX_M and session.actors.get("lead") is not None
-    lead_on_lane = _lead_on_travel_lane(session, axis)
+    lead_on_travel = _lead_actor_on_travel_lane(session, axis)
 
     meta: Dict[str, Any] = {
         "lead_axis_gap_m": lead_axis,
-        "lead_actor_visible_geometry": lead_ok and lead_on_lane,
+        "lead_actor_visible_geometry": lead_ok and lead_on_travel,
         "actor_axis_snapshot": axis,
         "used_detection_for_front": False,
         "passing_topology": topo.get("passing_topology"),
@@ -297,7 +311,7 @@ def resolve_lead_front_gap(
     if not oracle:
         vision_pool = _vision_front_pool(classified)
         if vision_pool:
-            pick = max(vision_pool, key=lambda c: float(c.get("depth_m", c.get("median_depth", 0.0))))
+            pick = _pick_vision_front_detection(session, vision_pool, lead_axis=lead_axis)
             raw_depth = float(pick["depth_m"])
             front_gap = calibrate_front_gap_m(raw_depth, session)
             calibrated_source = "raw_depth"
@@ -312,16 +326,14 @@ def resolve_lead_front_gap(
             meta["raw_detection_label"] = pick.get("raw_position_label", pick.get("position"))
             meta["matched_actor_for_detection"] = pick.get("matched_actor")
             meta["raw_depth_m"] = raw_depth
-        elif lead_ok and lead_on_lane:
-            use_axis = not classified or any(c.get("matched_actor") == "lead" for c in classified)
-            if use_axis:
-                front_gap = lead_axis
-                calibrated_source = "actor_axis_fallback"
-                resolution_reason = REASON_AXIS_FALLBACK
-                meta["used_detection_for_front"] = False
-                meta["final_front_gap_m"] = round(front_gap, 3)
-                meta["calibrated_gap_source"] = calibrated_source
-                meta["front_resolution_reason"] = resolution_reason
+        elif lead_ok and lead_on_travel:
+            front_gap = lead_axis
+            calibrated_source = "actor_axis_fallback"
+            resolution_reason = REASON_AXIS_FALLBACK
+            meta["used_detection_for_front"] = False
+            meta["final_front_gap_m"] = round(front_gap, 3)
+            meta["calibrated_gap_source"] = calibrated_source
+            meta["front_resolution_reason"] = resolution_reason
         else:
             meta["front_resolution_reason"] = REASON_NO_LEAD
         rear_gap, rear_source, rear_valid = _resolve_rear_gap(session, classified, axis)
@@ -345,7 +357,7 @@ def resolve_lead_front_gap(
         meta["decision_oracle"] = False
         return classified, gaps, meta
 
-    if lead_ok and lead_on_lane:
+    if lead_ok and lead_on_travel:
         lead_matched = _lead_detection_pool(classified)
         visual = _visual_lead_candidates(classified, lead_axis=lead_axis)
 

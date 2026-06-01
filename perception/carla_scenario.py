@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import math
 import os
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
@@ -89,6 +89,7 @@ class CarlaScenarioSession:
         self._sensor_warmup_ticks: int = 0
         self._sensor_warmup_method: str = "none"
         self._last_steer: float = 0.0
+        self._lane_marking_hint: Dict[str, Any] = {}
         self._lane_departure_stopped: bool = False
         self._corridor_report = None
         self._corridor_hero_fallback = False
@@ -666,6 +667,32 @@ class CarlaScenarioSession:
             return tw
         return self._wp_on_lane_ahead(tw, max(0.0, float(s_ego)), tw.lane_id, tw.road_id) or tw
 
+    def _passing_lane_anchor_at_ego(self, ego):
+        """Waypoint on the spawn passing lane at ego's longitudinal position."""
+        pw = self._passing_wp
+        if pw is None or ego is None:
+            return pw
+        if self.map is not None:
+            try:
+                ego_wp = self.map.get_waypoint(ego.get_location(), project_to_road=True)
+                if ego_wp is not None and int(ego_wp.road_id) == int(pw.road_id) and int(
+                    ego_wp.lane_id
+                ) == int(pw.lane_id):
+                    return ego_wp
+            except Exception:
+                pass
+        s_ego = self.project_actor_along_travel_axis(ego)
+        if s_ego is not None:
+            ahead = self._wp_on_lane_ahead(
+                pw, max(0.0, float(s_ego)), int(pw.lane_id), int(pw.road_id)
+            )
+            if ahead is not None:
+                return ahead
+        travel = self._travel_lane_anchor_at_ego(ego) or self._travel_wp
+        if travel is not None:
+            return self._adjacent_passing_lane_wp(travel, self._passing_side or "left") or pw
+        return pw
+
     def expected_passing_lane_width_m(self) -> float:
         """Lateral spacing between spawn travel and passing lane centers."""
         tw = self._travel_wp
@@ -677,20 +704,46 @@ class CarlaScenarioSession:
         except Exception:
             return 3.5
 
-    def lateral_shift_toward_passing_m(self, ego) -> float:
-        """Meters ego has shifted from travel lane toward the passing lane (0 = on travel)."""
+    def lateral_lane_offsets_m(self, ego) -> tuple[float, float, float]:
+        """(distance to travel center, distance to passing center, lane width)."""
         from perception.carla_lane_keep import lane_center_distance_m
 
         travel = self._travel_lane_anchor_at_ego(ego)
         if ego is None or travel is None or self._passing_wp is None:
-            return 0.0
-        passing = self._adjacent_passing_lane_wp(travel, self._passing_side or "left")
+            return 0.0, 0.0, 3.5
+        passing = self._passing_lane_anchor_at_ego(ego)
         if passing is None:
-            return 0.0
+            width = max(2.5, self.expected_passing_lane_width_m())
+            loc = ego.get_location()
+            dt = float(lane_center_distance_m(loc, travel))
+            return dt, dt, width
         loc = ego.get_location()
-        d_travel = lane_center_distance_m(loc, travel)
-        d_pass = lane_center_distance_m(loc, passing)
-        return max(0.0, float(d_travel) - float(d_pass))
+        width = max(2.5, self.expected_passing_lane_width_m())
+        return (
+            float(lane_center_distance_m(loc, travel)),
+            float(lane_center_distance_m(loc, passing)),
+            width,
+        )
+
+    def lateral_overshoot_past_passing_m(self, ego) -> float:
+        """Positive when ego is left of the passing-lane center beyond a comfort band."""
+        _d_travel, d_pass, width = self.lateral_lane_offsets_m(ego)
+        return max(0.0, float(d_pass) - width * 0.32)
+
+    def lateral_shift_toward_passing_m(self, ego) -> float:
+        """Meters ego has shifted from travel lane toward the passing lane (0 = on travel)."""
+        d_travel, d_pass, width = self.lateral_lane_offsets_m(ego)
+        if ego is None or self._passing_wp is None:
+            return 0.0
+        width = max(2.5, float(width))
+        side = self._passing_side or "left"
+        # Corridor progress: 0 at travel center, width at passing center (not saturated when
+        # CARLA lane_id flips before the body finishes crossing).
+        if side == "left":
+            shift = min(float(d_travel), max(0.0, width - float(d_pass)))
+        else:
+            shift = min(float(d_pass), max(0.0, width - float(d_travel)))
+        return min(width, max(0.0, shift))
 
     def ego_corridor_lane_offset_m(self, ego) -> float:
         """Min distance to travel or passing lane center (robust while between lanes)."""
@@ -704,18 +757,72 @@ class CarlaScenarioSession:
         pw = self._passing_wp
         if pw is None:
             return float(d_travel)
-        passing = self._adjacent_passing_lane_wp(travel, self._passing_side or "left")
+        passing = self._passing_lane_anchor_at_ego(ego)
         if passing is None:
             return float(d_travel)
         d_pass = lane_center_distance_m(loc, passing)
         return min(float(d_travel), float(d_pass))
+
+    def refresh_lane_marking_hint(self) -> Dict[str, Any]:
+        """Update straddle hint from latest ego semantic segmentation buffer."""
+        import numpy as np
+
+        from perception.lane_marking_vision import analyze_lane_markings_under_ego
+
+        seg_raw = getattr(self, "_seg_buf", None)
+        if seg_raw is None:
+            return dict(self._lane_marking_hint)
+        try:
+            seg = np.frombuffer(seg_raw.raw_data, dtype=np.uint8).reshape(
+                (seg_raw.height, seg_raw.width, 4)
+            )[:, :, 2]
+            hint = analyze_lane_markings_under_ego(
+                seg, passing_side=self._passing_side or "left"
+            )
+            self._lane_marking_hint = hint
+            return hint
+        except Exception:
+            return dict(self._lane_marking_hint)
+
+    def passing_lane_commit_alpha(self, ego) -> float:
+        """Minimum blend toward passing-lane center (geometry + optional vision boost)."""
+        if ego is None:
+            return 0.0
+        _d_travel, d_pass, width = self.lateral_lane_offsets_m(ego)
+        w = max(2.5, float(width))
+        shift = float(self.lateral_shift_toward_passing_m(ego))
+        from_shift = min(1.0, shift / w)
+        ratio = float(d_pass) / w
+        if ratio > 0.34:
+            from_pass = min(1.0, 0.52 + 0.55 * ratio)
+        else:
+            from_pass = min(1.0, max(0.0, 1.0 - float(d_pass) / (w * 0.55)))
+        alpha = max(from_shift, from_pass)
+        hint = self._lane_marking_hint or {}
+        if hint.get("center_line_under_ego") and float(d_pass) > w * 0.22:
+            try:
+                from perception.pass_control_fsm import get_pass_control_state
+
+                st = get_pass_control_state(self)
+                if st.active and st.phase in ("prepare_pass", "lane_change", "overtake"):
+                    alpha = min(1.0, alpha + float(hint.get("passing_commit_boost", 0.2)))
+            except Exception:
+                alpha = min(1.0, alpha + float(hint.get("passing_commit_boost", 0.2)))
+        return alpha
 
     def lane_change_blend_alpha(self, ego, *, min_commit_alpha: float = 0.0) -> float:
         from perception.carla_lane_keep import lane_change_blend_alpha
 
         shift = self.lateral_shift_toward_passing_m(ego)
         width = self.expected_passing_lane_width_m()
-        alpha = lane_change_blend_alpha(shift, width, lead_frac=0.28)
+        _d_travel, d_pass, _w = self.lateral_lane_offsets_m(ego) if ego is not None else (0.0, 0.0, width)
+        alpha = lane_change_blend_alpha(
+            shift,
+            width,
+            lead_frac=0.32,
+            dist_to_passing_center_m=float(d_pass),
+        )
+        alpha = max(alpha, self.passing_lane_commit_alpha(ego))
         return min(1.0, max(float(min_commit_alpha), alpha))
 
     def _lane_change_blend_at(
@@ -745,12 +852,11 @@ class CarlaScenarioSession:
         travel = self._travel_lane_anchor_at_ego(ego) or self._travel_wp
         if travel is None or self._passing_wp is None or ego is None:
             return None
-        passing = self._adjacent_passing_lane_wp(travel, self._passing_side or "left")
+        passing = self._passing_lane_anchor_at_ego(ego)
         if passing is None:
             return None
         width = self.expected_passing_lane_width_m()
-        shift = self.lateral_shift_toward_passing_m(ego)
-        alpha = min(1.0, max(0.0, float(shift) / width))
+        alpha = self.lane_change_blend_alpha(ego)
         return self._lane_change_blend_at(travel, passing, alpha=alpha, lookahead_m=None)
 
     def get_lane_change_steer_target_location(self, ego):
@@ -762,21 +868,66 @@ class CarlaScenarioSession:
         travel = self._travel_lane_anchor_at_ego(ego) or self._travel_wp
         if travel is None or self._passing_wp is None or ego is None:
             return None
-        passing = self._adjacent_passing_lane_wp(travel, self._passing_side or "left")
+        passing = self._passing_lane_anchor_at_ego(ego)
         if passing is None:
             return None
-        la = min(6.0, max(3.0, route_lookahead_m() * 0.32))
+        la = min(7.0, max(4.0, route_lookahead_m() * 0.38))
+        width = self.expected_passing_lane_width_m()
+        shift = self.lateral_shift_toward_passing_m(ego) if ego is not None else 0.0
+        progress = min(1.0, max(0.0, float(shift) / max(2.5, width)))
         min_alpha = 0.0
         try:
             from perception.pass_control_fsm import get_pass_control_state
 
             st = get_pass_control_state(self)
             if st.active and st.phase in ("prepare_pass", "lane_change"):
-                min_alpha = 0.34
+                min_alpha = min(0.38, 0.1 + 0.55 * progress)
         except Exception:
             pass
         alpha = self.lane_change_blend_alpha(ego, min_commit_alpha=min_alpha)
         return self._lane_change_blend_at(travel, passing, alpha=alpha, lookahead_m=la)
+
+    def merge_back_blend_alpha(self, ego) -> float:
+        """0 = passing-lane target, 1 = travel lane. Only increases after passing-lane capture."""
+        if ego is None:
+            return 0.0
+        d_travel, d_pass, width = self.lateral_lane_offsets_m(ego)
+        w = max(2.5, float(width))
+        if float(d_pass) > w * 0.38:
+            return 0.0
+        return min(1.0, max(0.0, 1.0 - float(d_travel) / w))
+
+    def get_merge_back_steer_target_location(self, ego):
+        """Short-lookahead blend from passing lane back to travel lane center."""
+        from autopass.carla_tuning import route_lookahead_m
+
+        travel = self._travel_lane_anchor_at_ego(ego) or self._travel_wp
+        if travel is None or self._passing_wp is None or ego is None:
+            return None
+        passing = self._passing_lane_anchor_at_ego(ego)
+        if passing is None:
+            return None
+        alpha = self.merge_back_blend_alpha(ego)
+        la = min(6.0, max(3.5, route_lookahead_m() * 0.32))
+        return self._lane_change_blend_at(travel, passing, alpha=alpha, lookahead_m=la)
+
+    def heading_error_to_travel_lane_deg(self, ego) -> float:
+        """Signed yaw error vs spawn travel lane forward (degrees)."""
+        travel = self._travel_lane_anchor_at_ego(ego) or self._travel_wp
+        if travel is None or ego is None:
+            return 0.0
+        ref_yaw = float(travel.transform.rotation.yaw)
+        ego_yaw = float(ego.get_transform().rotation.yaw)
+        return ((ref_yaw - ego_yaw + 180.0) % 360.0) - 180.0
+
+    def heading_error_to_passing_lane_deg(self, ego) -> float:
+        """Signed yaw error vs passing lane at ego longitude (degrees)."""
+        passing = self._passing_lane_anchor_at_ego(ego)
+        if passing is None or ego is None:
+            return 0.0
+        ref_yaw = float(passing.transform.rotation.yaw)
+        ego_yaw = float(ego.get_transform().rotation.yaw)
+        return ((ref_yaw - ego_yaw + 180.0) % 360.0) - 180.0
 
     def get_passing_lane_steering_waypoint(self, ego, *, lookahead_m: float | None = None):
         """Lookahead on the spawn adjacent passing lane centerline (not travel lane)."""
@@ -789,8 +940,7 @@ class CarlaScenarioSession:
         if pw is None or ego is None or tw is None:
             return pw
         la = float(lookahead_m) if lookahead_m is not None else min(8.0, route_lookahead_m() * 0.55)
-        travel = self._travel_lane_anchor_at_ego(ego) or tw
-        passing = self._adjacent_passing_lane_wp(travel, self._passing_side or "left") or pw
+        passing = self._passing_lane_anchor_at_ego(ego) or pw
         ahead = self._wp_on_lane_ahead(passing, la, int(pw.lane_id), int(pw.road_id))
         ref = ahead or passing
         return SimpleNamespace(
@@ -814,22 +964,75 @@ class CarlaScenarioSession:
                 from perception.pass_control_fsm import get_pass_control_state
 
                 st = get_pass_control_state(self)
-                if st.active and st.phase in ("prepare_pass", "lane_change"):
-                    min_alpha = 0.34
+                if st.active and st.phase in ("prepare_pass", "lane_change") and ego is not None:
+                    w = self.expected_passing_lane_width_m()
+                    prog = min(1.0, self.lateral_shift_toward_passing_m(ego) / max(2.5, w))
+                    min_alpha = min(0.38, 0.1 + 0.55 * prog)
             except Exception:
                 pass
         alpha = self.lane_change_blend_alpha(ego, min_commit_alpha=min_alpha) if ego is not None else 0.0
-        passing = self._adjacent_passing_lane_wp(travel, self._passing_side or passing_side)
+        passing = self._passing_lane_anchor_at_ego(ego) or self._adjacent_passing_lane_wp(
+            travel, self._passing_side or passing_side
+        )
         ref_meta = passing if (pw is not None and alpha >= 0.1 and passing is not None) else travel
         if pw is not None and alpha >= 0.1:
             ref_meta = pw
+        t_rot = travel.transform.rotation
+        if passing is not None:
+            from perception.carla_lane_keep import interpolate_yaw_deg
+
+            p_rot = passing.transform.rotation
+            yaw_alpha = float(alpha)
+            if ego is not None:
+                w = self.expected_passing_lane_width_m()
+                prog = min(1.0, self.lateral_shift_toward_passing_m(ego) / max(2.5, w))
+                yaw_alpha = max(yaw_alpha, min(1.0, prog * 1.08))
+            yaw = interpolate_yaw_deg(float(t_rot.yaw), float(p_rot.yaw), yaw_alpha)
+            rot = SimpleNamespace(
+                yaw=yaw,
+                pitch=float(t_rot.pitch),
+                roll=float(t_rot.roll),
+            )
+        else:
+            rot = t_rot
         return SimpleNamespace(
             lane_id=int(ref_meta.lane_id),
             road_id=int(ref_meta.road_id),
             transform=SimpleNamespace(
                 location=loc,
-                rotation=travel.transform.rotation,
+                rotation=rot,
             ),
+        )
+
+    def _merge_back_steer_waypoint(self, ego, passing_side: str = "left"):
+        from types import SimpleNamespace
+
+        from perception.carla_lane_keep import interpolate_yaw_deg
+
+        travel = self._travel_lane_anchor_at_ego(ego) or self._travel_wp
+        loc = self.get_merge_back_steer_target_location(ego)
+        if travel is None or loc is None:
+            return self.get_travel_steering_waypoint(ego)
+        passing = self._passing_lane_anchor_at_ego(ego) or self._adjacent_passing_lane_wp(
+            travel, self._passing_side or passing_side
+        )
+        alpha = self.merge_back_blend_alpha(ego) if ego is not None else 1.0
+        tw = self._travel_wp
+        t_rot = travel.transform.rotation
+        if passing is not None:
+            p_rot = passing.transform.rotation
+            yaw = interpolate_yaw_deg(float(t_rot.yaw), float(p_rot.yaw), alpha)
+            rot = SimpleNamespace(
+                yaw=yaw,
+                pitch=float(t_rot.pitch),
+                roll=float(t_rot.roll),
+            )
+        else:
+            rot = t_rot
+        return SimpleNamespace(
+            lane_id=int(tw.lane_id) if tw is not None else int(travel.lane_id),
+            road_id=int(tw.road_id) if tw is not None else int(travel.road_id),
+            transform=SimpleNamespace(location=loc, rotation=rot),
         )
 
     def ego_on_passing_lane(self, ego) -> bool:
@@ -1186,12 +1389,18 @@ class CarlaScenarioSession:
         side = self._passing_side or passing_side
         if phase in ("cruise", "travel"):
             return self.get_travel_steering_waypoint(ego)
-        if phase == "merge":
-            return self.get_travel_steering_waypoint(ego)
-        if phase in ("approach", "prepare_pass", "lane_change") and self._passing_wp is not None:
+        if phase in ("merge", "merge_back"):
+            _dt, d_pass, width = self.lateral_lane_offsets_m(ego)
+            if float(d_pass) > float(width) * 0.38:
+                return self._lane_change_steer_waypoint(ego, side)
+            return self._merge_back_steer_waypoint(ego, side)
+        if phase in ("approach", "prepare_pass", "lane_change", "overtake") and self._passing_wp is not None:
+            _dt, d_pass, width = self.lateral_lane_offsets_m(ego)
+            if phase == "overtake" and float(d_pass) < float(width) * 0.36:
+                return self.get_passing_lane_steering_waypoint(
+                    ego, lookahead_m=min(5.5, max(3.8, float(width) * 1.2))
+                )
             return self._lane_change_steer_waypoint(ego, side)
-        if phase == "overtake" and self._passing_wp is not None:
-            return self.get_passing_lane_steering_waypoint(ego)
         return self.get_travel_steering_waypoint(ego)
 
     def _snap_convoy_to_travel_lane(
@@ -3630,6 +3839,14 @@ class CarlaScenarioSession:
             + depth_a[:, :, 0].astype(np.float32) * 256 * 256
         )
         depth_m = depth_m / (256**3 - 1) * 1000.0
+        try:
+            from perception.lane_marking_vision import analyze_lane_markings_under_ego
+
+            self._lane_marking_hint = analyze_lane_markings_under_ego(
+                seg, passing_side=self._passing_side or "left"
+            )
+        except Exception:
+            pass
         return rgb.copy(), seg.copy(), depth_m.copy()
 
     def grab_overhead_rgb(self) -> Optional[np.ndarray]:

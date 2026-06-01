@@ -530,7 +530,7 @@ def main() -> None:
         print(f"  Map: {spec.route.town}")
         print(f"  Output: {args.out_dir}\n")
         os.environ["AUTOPASS_CONTROL_MODE"] = "vehicle"
-        os.environ.setdefault("AUTOPASS_EXECUTE_DT_S", "1.0")
+        os.environ.setdefault("AUTOPASS_EXECUTE_DT_S", "0.45")
         os.environ.setdefault("AUTOPASS_VIDEO_REALTIME", "1")
         os.environ.setdefault("AUTOPASS_DEMO_DENSE_FRAMES", "1")
         run_agentic_carla_loop(spec, world, args.out_dir, args.ticks, args.steps, policy=args.policy)

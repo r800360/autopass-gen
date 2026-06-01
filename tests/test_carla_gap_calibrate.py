@@ -17,3 +17,10 @@ def test_calibrate_keeps_close_depth():
     session.ready = True
     session.lead_longitudinal_gap_m.return_value = 30.0
     assert calibrate_front_gap_m(28.5, session) == 28.5
+
+
+def test_calibrate_prefers_closer_depth_when_passing_beside_lead():
+    session = MagicMock()
+    session.ready = True
+    session.lead_longitudinal_gap_m.return_value = 18.0
+    assert calibrate_front_gap_m(9.0, session) == 9.0

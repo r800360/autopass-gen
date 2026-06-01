@@ -134,15 +134,16 @@ def test_empty_pool_front_valid_from_lead_actor_axis_only():
     assert meta["used_detection_for_front"] is False
 
 
-def test_vision_only_no_axis_fallback_when_oracle_disabled(monkeypatch):
+def test_vision_only_axis_fallback_when_no_forward_detection(monkeypatch):
     monkeypatch.setenv("AUTOPASS_DECISION_ORACLE", "0")
     session = _session_with_lead(lead_gap_m=32.0, rear_gap_m=18.0)
     classified = [
         {"bbox": [290, 120, 330, 150], "median_depth": 15.5, "position": "rear", "depth_m": 15.5},
     ]
     _, gaps, meta = resolve_lead_front_gap(session, classified)
-    assert gaps["front_gap_m"] >= 200.0
+    assert gaps["front_gap_m"] == pytest.approx(32.0, rel=0.05)
     assert meta["used_detection_for_front"] is False
+    assert meta["calibrated_gap_source"] == "actor_axis_fallback"
     assert meta.get("decision_oracle") is False
 
 
@@ -157,6 +158,47 @@ def test_vision_only_front_from_forward_detection(monkeypatch):
     assert meta["used_detection_for_front"] is True
     assert gaps["front_gap_m"] == pytest.approx(28.0, rel=0.1)
     assert meta.get("decision_oracle") is False
+
+
+def test_vision_only_picks_closest_front_not_farthest_blob(monkeypatch):
+    """Two forward detections: must not keep stale 28m when 21m is the nearer lead."""
+    monkeypatch.setenv("AUTOPASS_DECISION_ORACLE", "0")
+    session = _session_with_lead(lead_gap_m=22.0, rear_gap_m=18.0)
+    classified = [
+        {"bbox": [400, 400, 500, 500], "median_depth": 28.0, "position": "front", "depth_m": 28.0},
+        {
+            "bbox": [420, 410, 520, 510],
+            "median_depth": 21.0,
+            "position": "front",
+            "depth_m": 21.0,
+            "matched_actor": "lead",
+        },
+        {"bbox": [290, 120, 330, 150], "median_depth": 15.5, "position": "rear", "depth_m": 15.5},
+    ]
+    _, gaps, meta = resolve_lead_front_gap(session, classified)
+    assert meta["used_detection_for_front"] is True
+    assert gaps["front_gap_m"] == pytest.approx(21.0, rel=0.05)
+
+
+def test_axis_fallback_when_ego_on_passing_lane(monkeypatch):
+    """Ego on lane 4, lead on travel lane 5 — axis gap must still resolve."""
+    monkeypatch.setenv("AUTOPASS_DECISION_ORACLE", "0")
+    session = _session_with_lead(lead_gap_m=12.5, rear_gap_m=18.0)
+    session._travel_wp = MagicMock(lane_id=5)
+    ego_loc = session.actors["ego"].get_location()
+    lead_loc = session.actors["lead"].get_location()
+
+    def _wp_for(loc, **kwargs):
+        lane = 5 if loc == lead_loc else 4
+        return MagicMock(lane_id=lane, road_id=6)
+
+    session.map.get_waypoint.side_effect = _wp_for
+    classified = [
+        {"bbox": [1, 1, 2, 2], "median_depth": 15.5, "position": "rear", "depth_m": 15.5},
+    ]
+    _, gaps, meta = resolve_lead_front_gap(session, classified)
+    assert gaps["front_gap_m"] == pytest.approx(12.5, rel=0.05)
+    assert meta["calibrated_gap_source"] == "actor_axis_fallback"
 
 
 def test_lead_matched_detection_can_be_used_for_front():

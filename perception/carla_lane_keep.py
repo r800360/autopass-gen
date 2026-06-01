@@ -77,16 +77,43 @@ def blend_locations(travel_loc, passing_loc, alpha: float):
     )()
 
 
-def lane_change_blend_alpha(shift_m: float, lane_width_m: float, *, lead_frac: float = 0.12) -> float:
+def interpolate_yaw_deg(yaw_a: float, yaw_b: float, t: float) -> float:
+    """Shortest-path yaw interpolation in degrees."""
+    t = min(1.0, max(0.0, float(t)))
+    delta = ((float(yaw_b) - float(yaw_a) + 180.0) % 360.0) - 180.0
+    out = float(yaw_a) + t * delta
+    return ((out + 180.0) % 360.0) - 180.0
+
+
+def lane_change_blend_alpha(
+    shift_m: float,
+    lane_width_m: float,
+    *,
+    lead_frac: float = 0.28,
+    dist_to_passing_center_m: float | None = None,
+) -> float:
     """
     Blend factor for lane-change steering (0=travel center, 1=passing center).
 
     ``lead_frac`` biases the target slightly ahead of current lateral progress so the
-    controller commits without chasing the far passing-lane waypoint (wide arc).
+    controller traces one smooth arc onto the passing lane (not travel-then-snap-left).
+
+    When ``dist_to_passing_center_m`` is set, also pull toward the passing center until
+    the body is off the lane marking (not only half-way by shift).
     """
     width = max(2.5, float(lane_width_m))
     progress = min(1.0, max(0.0, float(shift_m) / width))
-    return min(1.0, progress + lead_frac * (1.0 - progress))
+    alpha = min(1.0, progress + lead_frac * (1.0 - progress))
+    if dist_to_passing_center_m is not None:
+        d_pass = max(0.0, float(dist_to_passing_center_m))
+        ratio = d_pass / width
+        # While still far from passing-lane center (e.g. riding the lane line), steer decisively left.
+        if ratio > 0.34:
+            commit = min(1.0, 0.52 + 0.55 * ratio)
+        else:
+            commit = min(1.0, max(0.0, 1.0 - d_pass / (width * 0.55)))
+        alpha = max(alpha, commit)
+    return alpha
 
 
 def steering_phase_for_action(action: str, pass_phase: str) -> str:
