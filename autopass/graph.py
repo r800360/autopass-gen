@@ -418,7 +418,7 @@ def node_execute(state: AgenticState) -> Dict[str, Any]:
     backend = state.get("perception_backend", get_perception_backend())
     import os
 
-    execute_dt = float(os.environ.get("AUTOPASS_EXECUTE_DT_S", "0.5"))
+    execute_dt = float(os.environ.get("AUTOPASS_EXECUTE_DT_S", "0.35"))
     world_after, dsl, feedback = execute_step(spec, world, dsl, action, backend=backend, dt=execute_dt)
     from autopass.belief import observed_front_gap_m
 
@@ -546,6 +546,9 @@ def node_execute(state: AgenticState) -> Dict[str, Any]:
             "lateral_offset_travel_m": feedback.get("lateral_offset_travel_m"),
             "lateral_offset_passing_m": feedback.get("lateral_offset_passing_m"),
             "lateral_shift_toward_passing_m": feedback.get("lateral_shift_toward_passing_m"),
+            "duration_s": feedback.get("duration_s"),
+            "control_ticks": feedback.get("control_ticks"),
+            "execute_dt_s": execute_dt,
             "requested_action": feedback.get("requested_action", approved),
             "continue_pass_despite_wait": False,
             "planner_approved_maneuver": approved,

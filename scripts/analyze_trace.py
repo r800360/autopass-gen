@@ -14,7 +14,7 @@ print("by node:", nodes)
 execs = [e for e in t if e.get("node") == "execute"]
 print("executes:", len(execs))
 for i, e in enumerate(execs):
-    fb = e.get("feedback", e)
+    fb = e.get("feedback") or e
     ac = fb.get("actor_continuity", {})
     print(
         f"exec{i} action={e.get('action', fb.get('action'))} "

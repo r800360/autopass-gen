@@ -730,6 +730,21 @@ class CarlaScenarioSession:
         _d_travel, d_pass, width = self.lateral_lane_offsets_m(ego)
         return max(0.0, float(d_pass) - width * 0.32)
 
+    def ego_on_passing_corridor(
+        self,
+        ego,
+        *,
+        d_pass_frac: float = 0.42,
+        shift_frac: float = 0.55,
+    ) -> bool:
+        """True when ego is laterally on the passing lane (not still straddling)."""
+        if ego is None:
+            return False
+        _d_travel, d_pass, width = self.lateral_lane_offsets_m(ego)
+        w = max(2.5, float(width))
+        shift = float(self.lateral_shift_toward_passing_m(ego))
+        return float(d_pass) < w * float(d_pass_frac) and shift >= w * float(shift_frac)
+
     def lateral_shift_toward_passing_m(self, ego) -> float:
         """Meters ego has shifted from travel lane toward the passing lane (0 = on travel)."""
         d_travel, d_pass, width = self.lateral_lane_offsets_m(ego)
@@ -930,17 +945,34 @@ class CarlaScenarioSession:
         return ((ref_yaw - ego_yaw + 180.0) % 360.0) - 180.0
 
     def get_passing_lane_steering_waypoint(self, ego, *, lookahead_m: float | None = None):
-        """Lookahead on the spawn adjacent passing lane centerline (not travel lane)."""
+        """Lookahead on passing lane at ego longitude (curated axis, not wp.next chain)."""
         from types import SimpleNamespace
 
         from autopass.carla_tuning import route_lookahead_m
 
-        tw = self._travel_wp
         pw = self._passing_wp
-        if pw is None or ego is None or tw is None:
+        if pw is None or ego is None:
             return pw
         la = float(lookahead_m) if lookahead_m is not None else min(8.0, route_lookahead_m() * 0.55)
         passing = self._passing_lane_anchor_at_ego(ego) or pw
+        axis = self._travel_axis()
+        if axis is not None:
+            _, fwd = axis
+            loc = passing.transform.location
+            carla = self.carla
+            target_loc = carla.Location(
+                float(loc.x) + float(fwd[0]) * la,
+                float(loc.y) + float(fwd[1]) * la,
+                float(loc.z) + float(fwd[2]) * la,
+            )
+            return SimpleNamespace(
+                lane_id=int(pw.lane_id),
+                road_id=int(pw.road_id),
+                transform=SimpleNamespace(
+                    location=target_loc,
+                    rotation=passing.transform.rotation,
+                ),
+            )
         ahead = self._wp_on_lane_ahead(passing, la, int(pw.lane_id), int(pw.road_id))
         ref = ahead or passing
         return SimpleNamespace(
@@ -952,6 +984,9 @@ class CarlaScenarioSession:
     def _lane_change_steer_waypoint(self, ego, passing_side: str = "left"):
         """Steering reference on corridor road_id/lane_id with blended lateral target."""
         from types import SimpleNamespace
+
+        if ego is not None and self.ego_on_passing_corridor(ego):
+            return self.get_passing_lane_steering_waypoint(ego, lookahead_m=6.5)
 
         pw = self._passing_wp
         travel = self._travel_lane_anchor_at_ego(ego) or self._travel_wp
@@ -985,8 +1020,11 @@ class CarlaScenarioSession:
             yaw_alpha = float(alpha)
             if ego is not None:
                 w = self.expected_passing_lane_width_m()
-                prog = min(1.0, self.lateral_shift_toward_passing_m(ego) / max(2.5, w))
-                yaw_alpha = max(yaw_alpha, min(1.0, prog * 1.08))
+                _d_travel, d_pass, _w = self.lateral_lane_offsets_m(ego)
+                yaw_alpha = max(
+                    yaw_alpha,
+                    min(1.0, max(0.0, 1.0 - float(d_pass) / max(2.5, w))),
+                )
             yaw = interpolate_yaw_deg(float(t_rot.yaw), float(p_rot.yaw), yaw_alpha)
             rot = SimpleNamespace(
                 yaw=yaw,
@@ -1395,11 +1433,8 @@ class CarlaScenarioSession:
                 return self._lane_change_steer_waypoint(ego, side)
             return self._merge_back_steer_waypoint(ego, side)
         if phase in ("approach", "prepare_pass", "lane_change", "overtake") and self._passing_wp is not None:
-            _dt, d_pass, width = self.lateral_lane_offsets_m(ego)
-            if phase == "overtake" and float(d_pass) < float(width) * 0.36:
-                return self.get_passing_lane_steering_waypoint(
-                    ego, lookahead_m=min(5.5, max(3.8, float(width) * 1.2))
-                )
+            if phase == "overtake" and self.ego_on_passing_corridor(ego):
+                return self.get_passing_lane_steering_waypoint(ego, lookahead_m=6.5)
             return self._lane_change_steer_waypoint(ego, side)
         return self.get_travel_steering_waypoint(ego)
 

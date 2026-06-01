@@ -98,7 +98,7 @@ def run_hero_pass_demo(
     out_dir.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("AUTOPASS_CARLA_SKIP_PASS_BOOT_VALIDATE", "1")
     os.environ.setdefault("AUTOPASS_CONTROL_MODE", "vehicle")
-    os.environ.setdefault("AUTOPASS_EXECUTE_DT_S", "0.45")
+    os.environ.setdefault("AUTOPASS_EXECUTE_DT_S", "0.35")
     os.environ.setdefault("AUTOPASS_VIDEO_REALTIME", "1")
 
     map_name = spec.route.town or showcase_map_for_environment(case.environment)

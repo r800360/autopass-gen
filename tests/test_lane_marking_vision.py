@@ -15,6 +15,21 @@ def test_center_line_detected_under_ego():
     assert hint["passing_commit_boost"] > 0.1
 
 
+def test_ego_on_passing_corridor_when_centered_on_passing_lane():
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from perception.carla_scenario import CarlaScenarioSession
+
+    session = CarlaScenarioSession()
+    session.lateral_lane_offsets_m = lambda ego: (3.2, 0.3, 3.5)
+    session.lateral_shift_toward_passing_m = lambda ego: 3.0
+    assert session.ego_on_passing_corridor(SimpleNamespace()) is True
+    session.lateral_lane_offsets_m = lambda ego: (0.2, 2.5, 3.5)
+    session.lateral_shift_toward_passing_m = lambda ego: 0.5
+    assert session.ego_on_passing_corridor(SimpleNamespace()) is False
+
+
 def test_merge_back_blend_zero_until_passing_lane_captured():
     from types import SimpleNamespace
     from unittest.mock import MagicMock

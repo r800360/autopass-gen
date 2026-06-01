@@ -336,6 +336,13 @@ def build_vehicle_control(
     if scripted_phase is None and fsm_scripted is not None:
         scripted_phase = fsm_scripted
 
+    on_passing_corridor = (
+        session is not None
+        and ego is not None
+        and hasattr(session, "ego_on_passing_corridor")
+        and session.ego_on_passing_corridor(ego)
+    )
+
     steer_kw: dict = {}
     no_steer_penalty = False
     if scripted_phase == "lane_change":
@@ -372,17 +379,27 @@ def build_vehicle_control(
             lat_mult = max(lat_mult, 1.18)
             if hasattr(session, "passing_lane_commit_alpha"):
                 progress = max(progress, min(1.0, float(session.passing_lane_commit_alpha(ego))))
-        steer_kw = {
-            "max_steer_override": min(
-                max_steer() * min(cap_mult, 1.25) * (0.78 + 0.22 * progress),
-                0.26,
-            ),
-            "lateral_gain_mult": lat_mult,
-            "lookahead_mult": 0.46 + 0.12 * progress,
-            "smooth_mult": 0.55,
-            "max_delta": 0.036,
-        }
-        if overshoot_m > 0.12:
+        if on_passing_corridor:
+            steer_kw = {
+                "lateral_gain_mult": 0.86,
+                "lookahead_mult": 0.56,
+                "smooth_mult": 0.65,
+                "max_delta": 0.028,
+                "max_steer_override": min(0.11, max_steer()),
+            }
+            no_steer_penalty = True
+        else:
+            steer_kw = {
+                "max_steer_override": min(
+                    max_steer() * min(cap_mult, 1.25) * (0.78 + 0.22 * progress),
+                    0.26,
+                ),
+                "lateral_gain_mult": lat_mult,
+                "lookahead_mult": 0.46 + 0.12 * progress,
+                "smooth_mult": 0.55,
+                "max_delta": 0.036,
+            }
+        if overshoot_m > 0.12 and not on_passing_corridor:
             steer_kw["max_steer_override"] = min(0.1, max_steer())
             steer_kw["lateral_gain_mult"] = 0.58
             steer_kw["lookahead_mult"] = 0.62
@@ -409,8 +426,23 @@ def build_vehicle_control(
             )
         else:
             target = max(target, spec.route.speed_limit_mps * 0.78)
-        steer_kw = {"lateral_gain_mult": 0.92, "lookahead_mult": 0.72, "max_delta": 0.035}
-        if session is not None and ego is not None and hasattr(session, "lateral_lane_offsets_m"):
+        if on_passing_corridor:
+            steer_kw = {
+                "lateral_gain_mult": 0.86,
+                "lookahead_mult": 0.56,
+                "smooth_mult": 0.65,
+                "max_delta": 0.028,
+                "max_steer_override": min(0.11, max_steer()),
+            }
+            no_steer_penalty = True
+        else:
+            steer_kw = {"lateral_gain_mult": 0.92, "lookahead_mult": 0.72, "max_delta": 0.035}
+        if (
+            not on_passing_corridor
+            and session is not None
+            and ego is not None
+            and hasattr(session, "lateral_lane_offsets_m")
+        ):
             _dt, d_pass, width = session.lateral_lane_offsets_m(ego)
             if float(d_pass) > float(width) * 0.75:
                 steer_kw = {
@@ -420,7 +452,8 @@ def build_vehicle_control(
                     "max_steer_override": min(0.14, max_steer()),
                 }
         if (
-            session is not None
+            not on_passing_corridor
+            and session is not None
             and ego is not None
             and hasattr(session, "lateral_overshoot_past_passing_m")
             and float(session.lateral_overshoot_past_passing_m(ego)) > 0.15
@@ -432,7 +465,6 @@ def build_vehicle_control(
                 "max_steer_override": min(0.11, max_steer()),
                 "smooth_mult": 0.5,
             }
-
     head_err = 0.0
     lat_err = 0.0
     target_lane_id = None
@@ -481,6 +513,7 @@ def build_vehicle_control(
         if (
             unstable_heading
             and pass_lateral_active
+            and not (on_passing_corridor and abs(head_err) < 38.0)
             and session is not None
             and hasattr(session, "_lane_change_steer_waypoint")
         ):
@@ -554,22 +587,23 @@ def build_vehicle_control(
         no_steer_penalty=no_steer_penalty,
         phase=phase,
     )
-    if abs(head_err) > 30.0 or abs(lat_err) > 2.5:
-        ctrl.throttle = min(ctrl.throttle, 0.18)
-        ctrl.brake = max(ctrl.brake, 0.12 if current > 4.0 else 0.0)
-    if scripted_phase in ("lane_change", "overtake") and abs(head_err) > 22.0:
-        ctrl.throttle = min(ctrl.throttle, 0.28)
-        ctrl.brake = max(ctrl.brake, 0.08 if current > 3.0 else 0.0)
-    if scripted_phase in ("lane_change", "overtake") and abs(head_err) > 45.0:
-        ctrl.throttle = min(ctrl.throttle, 0.12)
-        ctrl.brake = max(ctrl.brake, 0.15 if current > 2.5 else 0.05)
+    if not on_passing_corridor:
+        if abs(head_err) > 30.0 or abs(lat_err) > 2.5:
+            ctrl.throttle = min(ctrl.throttle, 0.18)
+            ctrl.brake = max(ctrl.brake, 0.12 if current > 4.0 else 0.0)
+        if scripted_phase in ("lane_change", "overtake") and abs(head_err) > 22.0:
+            ctrl.throttle = min(ctrl.throttle, 0.28)
+            ctrl.brake = max(ctrl.brake, 0.08 if current > 3.0 else 0.0)
+        if scripted_phase in ("lane_change", "overtake") and abs(head_err) > 45.0:
+            ctrl.throttle = min(ctrl.throttle, 0.12)
+            ctrl.brake = max(ctrl.brake, 0.15 if current > 2.5 else 0.05)
     if action_semantic == "follow_lead" and (abs(head_err) > 20.0 or abs(lat_err) > 2.0):
         ctrl.brake = min(ctrl.brake, 0.25)
         ctrl.throttle = min(ctrl.throttle, 0.35)
     if scripted_phase == "lane_change" and current < 6.5 and pass_maneuver_started:
         ctrl.throttle = max(ctrl.throttle, 0.42)
         ctrl.brake = min(ctrl.brake, 0.05)
-    if scripted_phase == "overtake" and current < 7.0:
+    if scripted_phase == "overtake" and current < 7.0 and not on_passing_corridor:
         ctrl.throttle = max(ctrl.throttle, 0.32)
         ctrl.brake = min(ctrl.brake, 0.06)
     ctrl.throttle = max(0.0, min(0.72, ctrl.throttle))
