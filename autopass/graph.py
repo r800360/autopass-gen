@@ -111,9 +111,13 @@ def node_planner(state: AgenticState) -> Dict[str, Any]:
     spec = _spec(state)
     world = _world(state)
     dsl = _dsl(state)
+    trace = list(state.get("trace", []))
+    max_steps = int(state.get("max_drive_steps", 90))
+    if len(trace) >= max_steps * 7 + 60:
+        return {"phase": "done", "planner_rounds": state.get("planner_rounds", 0), "trace": trace}
     rounds = state.get("planner_rounds", 0) + 1
     if rounds > state.get("max_planner_rounds", 12) * 4:
-        return {"phase": "done", "planner_rounds": rounds, "trace": list(state.get("trace", []))}
+        return {"phase": "done", "planner_rounds": rounds, "trace": trace}
 
     pass_active = bool(state.get("pass_in_progress", False))
     insufficient = dict(state.get("insufficient_counts_by_tool", {}))
@@ -155,7 +159,9 @@ def node_planner(state: AgenticState) -> Dict[str, Any]:
         from autopass.perception_state import needed_tools
         from autopass.planner import PlannerDecision
 
-        missing = needed_tools(dsl, spec, world, block_front_measure=block_front)
+        missing = needed_tools(
+            dsl, spec, world, block_front_measure=block_front, pass_in_progress=pass_active
+        )
         if missing and decision.action == "run_tool":
             required_tool, required_why = missing[0]
             if decision.tool != required_tool:
@@ -167,7 +173,9 @@ def node_planner(state: AgenticState) -> Dict[str, Any]:
     from autopass.pass_gates import evaluate_pass_gates
     from autopass.tools import perception_summary
 
-    gate_eval = evaluate_pass_gates(dsl, spec, world, summary=perception_summary(dsl))
+    gate_eval = evaluate_pass_gates(
+        dsl, spec, world, summary=perception_summary(dsl), pass_in_progress=pass_active
+    )
     trace = list(state.get("trace", []))
     trace.append(
         {
@@ -347,7 +355,13 @@ def node_critique_maneuver(state: AgenticState) -> Dict[str, Any]:
     from autopass.pass_gates import evaluate_pass_gates
     from autopass.tools import perception_summary
 
-    gate_eval = evaluate_pass_gates(dsl, spec, world, summary=perception_summary(dsl))
+    gate_eval = evaluate_pass_gates(
+        dsl,
+        spec,
+        world,
+        summary=perception_summary(dsl),
+        pass_in_progress=bool(state.get("pass_in_progress", False)),
+    )
     trace.append(
         {
             "node": "critic_maneuver",
@@ -379,13 +393,23 @@ def node_critique_maneuver(state: AgenticState) -> Dict[str, Any]:
 
 
 def _pass_maneuver_complete(world_after: WorldState, feedback: Dict[str, Any]) -> bool:
-    if feedback.get("ego_lane", world_after.ego_lane) != 0:
+    if world_after.passed:
+        return True
+    if not feedback.get("pass_maneuver_started"):
+        return False
+    if feedback.get("pass_fsm_active"):
         return False
     if not feedback.get("clear_of_lead"):
         return False
-    if feedback.get("pass_phase") not in ("merge", "cruise"):
-        return False
-    return True
+    travel_lane_id = feedback.get("travel_lane_id")
+    ego_lane_id = feedback.get("ego_lane_id", feedback.get("ego_lane"))
+    if travel_lane_id is not None and ego_lane_id is not None:
+        return int(ego_lane_id) == int(travel_lane_id)
+    if feedback.get("ego_lane", world_after.ego_lane) == 0:
+        return True
+    if feedback.get("pass_phase") in ("merge", "cruise"):
+        return True
+    return False
 
 
 def node_execute(state: AgenticState) -> Dict[str, Any]:
@@ -444,17 +468,22 @@ def node_execute(state: AgenticState) -> Dict[str, Any]:
     )
     maneuver_started = bool(feedback.get("pass_maneuver_started", False))
     maneuver_completed = action == "pass" and _pass_maneuver_complete(world_after, feedback)
-    if feedback.get("pass_fsm_active") is False and pass_active and feedback.get("pass_abort_reason"):
-        pass_active = False
-    if feedback.get("control_failure") and feedback.get("pass_abort_reason"):
-        pass_active = False
+    abort_reason = str(feedback.get("pass_abort_reason") or "")
+    finishing_pass = bool(feedback.get("pass_corridor_committed")) and not feedback.get(
+        "clear_of_lead"
+    )
+    recoverable_abort = finishing_pass and "lane_departure" in abort_reason
+    if pass_active and abort_reason and not recoverable_abort:
+        if feedback.get("pass_fsm_active") is False or feedback.get("control_failure"):
+            pass_active = False
     if action == "pass" and maneuver_completed:
         pass_active = False
         world_after = replace(world_after, passed=True)
 
     proposed = state.get("proposed_maneuver", "wait")
+    continued_pass = pass_active and approved == "wait" and action == "pass"
     if action == "pass":
-        if proposed != "pass":
+        if proposed != "pass" and not continued_pass:
             execution_outcome = "pass_attempt_blocked_by_critic"
         elif feedback.get("collision"):
             execution_outcome = "pass_attempt_collision"
@@ -521,6 +550,9 @@ def node_execute(state: AgenticState) -> Dict[str, Any]:
             "target_lane_id": feedback.get("target_lane_id"),
             "lane_center_error_m": feedback.get("lane_center_error_m"),
             "heading_error_deg": feedback.get("heading_error_deg"),
+            "travel_heading_error_deg": feedback.get("travel_heading_error_deg"),
+            "passing_heading_error_deg": feedback.get("passing_heading_error_deg"),
+            "corridor_ok": feedback.get("corridor_ok"),
             "steer": feedback.get("steer"),
             "throttle": feedback.get("throttle"),
             "brake": feedback.get("brake"),
@@ -546,11 +578,16 @@ def node_execute(state: AgenticState) -> Dict[str, Any]:
             "lateral_offset_travel_m": feedback.get("lateral_offset_travel_m"),
             "lateral_offset_passing_m": feedback.get("lateral_offset_passing_m"),
             "lateral_shift_toward_passing_m": feedback.get("lateral_shift_toward_passing_m"),
+            "pass_corridor_committed": feedback.get("pass_corridor_committed"),
+            "pass_peak_shift_m": feedback.get("pass_peak_shift_m"),
+            "lead_longitudinal_gap_m": feedback.get("lead_longitudinal_gap_m"),
+            "ego_s_m": (feedback.get("pass_longitudinal") or {}).get("ego_s_m"),
+            "lead_s_m": (feedback.get("pass_longitudinal") or {}).get("lead_s_m"),
             "duration_s": feedback.get("duration_s"),
             "control_ticks": feedback.get("control_ticks"),
             "execute_dt_s": execute_dt,
             "requested_action": feedback.get("requested_action", approved),
-            "continue_pass_despite_wait": False,
+            "continue_pass_despite_wait": continued_pass,
             "planner_approved_maneuver": approved,
             "decision_oracle_enabled": __import__(
                 "autopass.config", fromlist=["decision_oracle_enabled"]
@@ -642,9 +679,13 @@ def route_after_planner(state: AgenticState) -> str:
     return "planner"
 
 
+def _execute_step_count(trace: list) -> int:
+    return sum(1 for entry in trace if entry.get("node") == "execute")
+
+
 def route_after_execute(state: AgenticState) -> str:
     world = _world(state)
-    if world.done or len(state.get("trace", [])) >= state.get("max_drive_steps", 90):
+    if world.done or _execute_step_count(state.get("trace", [])) >= state.get("max_drive_steps", 90):
         return "evaluate"
     return "planner"
 

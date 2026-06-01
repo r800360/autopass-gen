@@ -227,6 +227,11 @@ def capture_multi_frame_perception(
     else:
         front_car_speed = None
 
+    if front_car_speed is None and backend == "carla" and len(valid_front) >= 2:
+        depths_only = [v[1] for v in valid_front]
+        if max(depths_only) - min(depths_only) < 1.25:
+            front_car_speed = 0.0
+
     CAR_LENGTH_TO_WIDTH_RATIO = 2.0
     valid_lengths = []
     for bbox_w, depth in front_bboxes:

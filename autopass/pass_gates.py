@@ -70,6 +70,8 @@ def evaluate_pass_gates(
     spec: ScenarioSpec,
     world: WorldState,
     summary: Optional[Dict[str, Any]] = None,
+    *,
+    pass_in_progress: bool = False,
 ) -> Dict[str, Any]:
     from autopass.tools import perception_summary
 
@@ -97,8 +99,19 @@ def evaluate_pass_gates(
             and front_gap >= MIN_PASS_FRONT_GAP_M
         )
     )
-    _, lead_ok = lead_speed_if_available(dsl)
-    slow_lead_ok = bool(lead_cleared or (lead_ok and slow_lead(dsl, world)))
+    if pass_in_progress and not front_gap_ok:
+        try:
+            from perception.carla_scenario import get_session
+            from perception.pass_control_fsm import get_pass_control_state
+
+            session = get_session()
+            if session.ready:
+                pst = get_pass_control_state(session)
+                if pst.maneuver_started or getattr(session, "_pass_corridor_committed", False):
+                    front_gap_ok = True
+        except Exception:
+            pass
+    slow_lead_ok = bool(lead_cleared or slow_lead(dsl, world))
 
     rear_meas = summary.get("measure_rear_gap") or {}
     rear_gap_ok = bool(wb.rear_valid and rear_meas.get("safe", False))
@@ -154,6 +167,7 @@ def evaluate_pass_gates(
                 f"front gap is only {front_gap:.1f}m (below {MIN_PASS_FRONT_GAP_M:.0f}m passing threshold)"
             )
     if not slow_lead_ok:
+        _, lead_ok = lead_speed_if_available(dsl)
         if not lead_ok:
             blockers.append("lead speed is unavailable")
         else:

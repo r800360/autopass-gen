@@ -102,12 +102,16 @@ def _rule_plan(
         return PlannerDecision(action="finish", reasoning="Episode terminal state reached.")
 
     if dsl.mission.aggression == "0":
-        missing = needed_tools(dsl, spec, world, block_front_measure=block_front_measure)
+        missing = needed_tools(
+            dsl, spec, world, block_front_measure=block_front_measure, pass_in_progress=pass_in_progress
+        )
         if missing:
             return PlannerDecision(action="run_tool", tool=missing[0][0], reasoning=missing[0][1])
         return PlannerDecision(action="decide_maneuver", maneuver="wait", reasoning="No-pass policy.")
 
-    missing = needed_tools(dsl, spec, world, block_front_measure=block_front_measure)
+    missing = needed_tools(
+        dsl, spec, world, block_front_measure=block_front_measure, pass_in_progress=pass_in_progress
+    )
     recent_critic = [n for n in dsl.verification_log[-6:] if n.tool]
     recent_capture_insufficient = sum(
         1 for n in recent_critic if n.tool == "capture_sensors" and n.verdict == "insufficient"
@@ -174,7 +178,7 @@ def _decide_maneuver_from_evidence(
 
     if pass_in_progress:
         if not pass_evidence_complete(dsl):
-            missing = needed_tools(dsl, spec, world)
+            missing = needed_tools(dsl, spec, world, pass_in_progress=True)
             if missing:
                 return PlannerDecision(action="run_tool", tool=missing[0][0], reasoning=f"Pass active: {missing[0][1]}")
         rear = summary.get("measure_rear_gap", {})
@@ -188,7 +192,7 @@ def _decide_maneuver_from_evidence(
 
     gates = evaluate_pass_gates(dsl, spec, world, summary=summary)
     if not gates["can_pass"]:
-        missing = needed_tools(dsl, spec, world)
+        missing = needed_tools(dsl, spec, world, pass_in_progress=pass_in_progress)
         if missing:
             return PlannerDecision(action="run_tool", tool=missing[0][0], reasoning=missing[0][1])
         blockers = gates["pass_blockers"]
@@ -277,7 +281,9 @@ def _llm_plan(
 ) -> PlannerDecision:
     from agents.llm_agents import structured_invoke
 
-    missing = needed_tools(dsl, spec, world, block_front_measure=block_front_measure)
+    missing = needed_tools(
+        dsl, spec, world, block_front_measure=block_front_measure, pass_in_progress=pass_in_progress
+    )
     summary = perception_summary(dsl)
     gates = evaluate_pass_gates(dsl, spec, world, summary=summary)
 

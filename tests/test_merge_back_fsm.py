@@ -54,3 +54,163 @@ def test_overtake_does_not_merge_back_without_clearance():
         session, ego, front_gap_m=18.0, clear_of_lead=False, speed_mps=8.0
     )
     assert st.phase == "overtake"
+
+
+def test_overtake_slip_to_travel_recommits_lane_change():
+    tw = SimpleNamespace(
+        lane_id=5,
+        road_id=1,
+        transform=SimpleNamespace(location=SimpleNamespace(x=0.0, y=0.0, z=0.0)),
+    )
+    pw = SimpleNamespace(
+        lane_id=4,
+        road_id=1,
+        transform=SimpleNamespace(location=SimpleNamespace(x=0.0, y=3.5, z=0.0)),
+    )
+    session = SimpleNamespace(
+        map=None,
+        _travel_wp=tw,
+        _passing_wp=pw,
+        _passing_side="left",
+        expected_passing_lane_width_m=lambda: 3.5,
+        lateral_shift_toward_passing_m=lambda ego: 0.1,
+        _travel_lane_anchor_at_ego=lambda ego: tw,
+        _passing_lane_anchor_at_ego=lambda ego: pw,
+        _adjacent_passing_lane_wp=lambda ego_wp, side: pw,
+        ego_cleared_lead=lambda c: False,
+        ego_clear_of_lead=lambda c: False,
+        lead_longitudinal_gap_m=lambda: 12.0,
+    )
+    ego = _ego()
+    st = get_pass_control_state(session)
+    st.active = True
+    st.phase = "overtake"
+    st.maneuver_started = True
+    st.ticks_in_phase = 3
+    session.lateral_lane_offsets_m = lambda ego: (0.4, 2.2, 3.5)
+
+    st = advance_pass_fsm(
+        session, ego, front_gap_m=12.0, clear_of_lead=False, speed_mps=6.0
+    )
+    assert st.phase == "lane_change"
+
+
+def test_overtake_merge_back_when_long_cleared():
+    tw = SimpleNamespace(
+        lane_id=5,
+        road_id=1,
+        transform=SimpleNamespace(location=SimpleNamespace(x=0.0, y=0.0, z=0.0)),
+    )
+    pw = SimpleNamespace(
+        lane_id=4,
+        road_id=1,
+        transform=SimpleNamespace(location=SimpleNamespace(x=0.0, y=3.5, z=0.0)),
+    )
+    session = SimpleNamespace(
+        map=None,
+        _travel_wp=tw,
+        _passing_wp=pw,
+        _passing_side="left",
+        expected_passing_lane_width_m=lambda: 3.5,
+        lateral_shift_toward_passing_m=lambda ego: 1.8,
+        _travel_lane_anchor_at_ego=lambda ego: tw,
+        _passing_lane_anchor_at_ego=lambda ego: pw,
+        _adjacent_passing_lane_wp=lambda ego_wp, side: pw,
+        ego_cleared_lead=lambda c: True,
+        ego_clear_of_lead=lambda c: True,
+        lead_longitudinal_gap_m=lambda: 2.0,
+    )
+    ego = _ego()
+    st = get_pass_control_state(session)
+    st.active = True
+    st.phase = "overtake"
+    st.maneuver_started = True
+    st.ticks_in_phase = 8
+    session.lateral_lane_offsets_m = lambda ego: (2.0, 1.5, 3.5)
+
+    st = advance_pass_fsm(
+        session, ego, front_gap_m=20.0, clear_of_lead=True, speed_mps=8.0
+    )
+    assert st.phase == "merge_back"
+
+
+def test_corridor_committed_stays_overtake_despite_slip():
+    tw = SimpleNamespace(
+        lane_id=5,
+        road_id=1,
+        transform=SimpleNamespace(location=SimpleNamespace(x=0.0, y=0.0, z=0.0)),
+    )
+    pw = SimpleNamespace(
+        lane_id=4,
+        road_id=1,
+        transform=SimpleNamespace(location=SimpleNamespace(x=0.0, y=3.5, z=0.0)),
+    )
+    session = SimpleNamespace(
+        map=None,
+        _travel_wp=tw,
+        _passing_wp=pw,
+        _passing_side="left",
+        expected_passing_lane_width_m=lambda: 3.5,
+        lateral_shift_toward_passing_m=lambda ego: 0.1,
+        _travel_lane_anchor_at_ego=lambda ego: tw,
+        _passing_lane_anchor_at_ego=lambda ego: pw,
+        _adjacent_passing_lane_wp=lambda ego_wp, side: pw,
+        ego_cleared_lead=lambda c: False,
+        ego_clear_of_lead=lambda c: False,
+        lead_longitudinal_gap_m=lambda: 12.0,
+        _pass_corridor_committed=True,
+        _pass_peak_shift_m=3.2,
+        actor_travel_s=lambda name: 25.0,
+        _pass_fsm_last_ego_s=24.0,
+    )
+    ego = _ego()
+    st = get_pass_control_state(session)
+    st.active = True
+    st.phase = "overtake"
+    st.maneuver_started = True
+    st.ticks_in_phase = 8
+    session.lateral_lane_offsets_m = lambda ego: (0.4, 2.2, 3.5)
+
+    st = advance_pass_fsm(
+        session, ego, front_gap_m=12.0, clear_of_lead=False, speed_mps=6.0
+    )
+    assert st.phase == "overtake"
+
+
+def test_overtake_corridor_departure_recommits_lane_change():
+    tw = SimpleNamespace(
+        lane_id=5,
+        road_id=1,
+        transform=SimpleNamespace(location=SimpleNamespace(x=0.0, y=0.0, z=0.0)),
+    )
+    pw = SimpleNamespace(
+        lane_id=4,
+        road_id=1,
+        transform=SimpleNamespace(location=SimpleNamespace(x=0.0, y=3.5, z=0.0)),
+    )
+    session = SimpleNamespace(
+        map=None,
+        _travel_wp=tw,
+        _passing_wp=pw,
+        _passing_side="left",
+        expected_passing_lane_width_m=lambda: 3.5,
+        lateral_shift_toward_passing_m=lambda ego: 0.0,
+        _travel_lane_anchor_at_ego=lambda ego: tw,
+        _passing_lane_anchor_at_ego=lambda ego: pw,
+        _adjacent_passing_lane_wp=lambda ego_wp, side: pw,
+        ego_cleared_lead=lambda c: False,
+        actor_travel_s=lambda name: 22.5,
+        _pass_fsm_last_ego_s=22.5,
+    )
+    ego = _ego()
+    st = get_pass_control_state(session)
+    st.active = True
+    st.phase = "overtake"
+    st.maneuver_started = True
+    st.ticks_in_phase = 6
+    session.lateral_lane_offsets_m = lambda ego: (6.5, 5.5, 3.5)
+
+    st = advance_pass_fsm(
+        session, ego, front_gap_m=10.0, clear_of_lead=False, speed_mps=5.7
+    )
+    assert st.phase == "lane_change"

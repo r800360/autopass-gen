@@ -230,6 +230,11 @@ def patch_belief_from_capture(belief: WorldBelief, payload: Dict[str, Any]) -> W
     if lead_speed is None and front_valid:
         lr = payload.get("lead_resolution") or {}
         lead_speed = _float_or_none(lr.get("lead_speed_mps"))
+    if lead_speed is None and belief.lead_speed_mps is not None and (front_valid or belief.front_valid):
+        lead_speed = belief.lead_speed_mps
+        if front_gap is None or float(front_gap) >= FRONT_MAX_DEPTH_M:
+            front_gap = belief.front_gap_m
+            front_valid = belief.front_valid
     if lead_speed is None and front_valid:
         try:
             from autopass.config import decision_oracle_enabled
@@ -429,7 +434,11 @@ def needed_tools(
     world: WorldState,
     *,
     block_front_measure: bool = False,
+    pass_in_progress: bool = False,
 ) -> List[Tuple[str, str]]:
+    if pass_in_progress and pass_evidence_complete(dsl):
+        return []
+
     if dsl.mission.aggression == "0":
         if "capture_sensors" not in dsl.tools_completed:
             return [("capture_sensors", "No-pass policy: minimal vision burst")]

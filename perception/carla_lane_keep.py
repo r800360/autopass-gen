@@ -30,6 +30,28 @@ def heading_error_deg(ego_yaw_deg: float, target_loc, ego_loc) -> float:
     return normalize_angle_deg(target_yaw - ego_yaw_deg)
 
 
+def steer_from_lane_errors(
+    ego_loc,
+    ego_yaw_deg: float,
+    heading_err_deg: float,
+    lateral_err_m: float,
+    *,
+    lookahead_m: float = 10.0,
+    max_steer: float = 0.18,
+    steer_gain: float = 60.0,
+    lateral_gain: float = 0.35,
+    prev_steer: float = 0.0,
+    smooth: float = 0.35,
+) -> Tuple[float, float, float]:
+    """Steer from lane-aligned yaw/lateral errors (avoids 180° point-to-point artifacts)."""
+    head = normalize_angle_deg(float(heading_err_deg))
+    lat = float(lateral_err_m)
+    raw = head / max(1e-3, steer_gain) + lateral_gain * math.atan2(lat, max(1.0, lookahead_m)) / math.pi
+    raw = max(-max_steer, min(max_steer, raw))
+    steer = (1.0 - smooth) * prev_steer + smooth * raw
+    return max(-max_steer, min(max_steer, steer)), head, lat
+
+
 def pure_pursuit_steer(
     ego_loc,
     ego_yaw_deg: float,

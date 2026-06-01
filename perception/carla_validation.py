@@ -86,6 +86,14 @@ def _validate_carla_actors(session) -> List[str]:
             if lead_gap is None:
                 issues.append("lead_projection_unavailable")
             elif lead_gap < MIN_LEAD_GAP_M and d < MIN_LEAD_GAP_M + 1.5:
+                adjacent_pass = (
+                    ego_wp is not None
+                    and actor_wp is not None
+                    and int(ego_wp.road_id) == int(actor_wp.road_id)
+                    and int(ego_wp.lane_id) != int(actor_wp.lane_id)
+                )
+                if adjacent_pass and d >= MIN_LEAD_GAP_M:
+                    continue
                 issues.append(f"lead_too_close_longitudinal: {lead_gap:.1f}m (euclid={d:.1f}m)")
             continue
 

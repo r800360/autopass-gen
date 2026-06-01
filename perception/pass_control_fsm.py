@@ -159,6 +159,9 @@ def resolve_target_lane_ids(session, fsm_phase: PassFsmPhase) -> Dict[str, Any]:
 def begin_pass(session) -> PassControlState:
     st = get_pass_control_state(session)
     st.reset()
+    session._pass_corridor_committed = False
+    session._pass_peak_shift_m = 0.0
+    session._pass_realign_done = False
     st.active = True
     st.phase = "prepare_pass"
     if session._passing_wp is None:
@@ -183,6 +186,17 @@ def abort_pass(session, reason: str) -> PassControlState:
 
 
 def check_multi_lane_departure(session, ego) -> Tuple[bool, str]:
+    from perception.pass_geometry import pass_finish_active
+
+    clear_of_lead = False
+    if hasattr(session, "ego_cleared_lead"):
+        try:
+            clear_of_lead = bool(session.ego_cleared_lead(merge_clear_m()))
+        except Exception:
+            pass
+    if pass_finish_active(session, clear_of_lead=clear_of_lead):
+        return False, ""
+
     d_travel, d_pass, width = _lane_offsets_m(session, ego)
     fail_m = max(lane_departure_fail_m(), width * MULTI_LANE_FAIL_MULT)
     st = get_pass_control_state(session)
@@ -212,6 +226,11 @@ def advance_pass_fsm(
     st.ticks_in_phase += 1
     d_travel, d_pass, width = _lane_offsets_m(session, ego)
     shift = session.lateral_shift_toward_passing_m(ego) if hasattr(session, "lateral_shift_toward_passing_m") else 0.0
+    peak_shift = max(float(getattr(session, "_pass_peak_shift_m", 0.0)), float(shift))
+    session._pass_peak_shift_m = peak_shift
+    if peak_shift >= width * 0.45 or shift >= width * 0.40 or d_pass < width * 0.42:
+        session._pass_corridor_committed = True
+    lateral_latched = bool(getattr(session, "_pass_corridor_committed", False))
     on_pass = _on_passing_lane(session, ego)
 
     long_gap = front_gap_m
@@ -244,6 +263,24 @@ def advance_pass_fsm(
         return st
 
     if st.phase == "lane_change":
+        long_cleared_lc = clear_of_lead
+        if hasattr(session, "ego_cleared_lead"):
+            long_cleared_lc = bool(session.ego_cleared_lead(merge_clear_m()))
+        if lateral_latched and not long_cleared_lc:
+            st.phase = "overtake"
+            st.ticks_in_phase = 0
+            st.maneuver_started = True
+            return st
+        if (
+            st.maneuver_started
+            and st.ticks_in_phase > 6
+            and float(speed_mps) < 0.6
+            and peak_shift >= width * 0.35
+            and d_pass < width * 1.05
+        ):
+            st.phase = "overtake"
+            st.ticks_in_phase = 0
+            return st
         ego_on_passing = False
         try:
             ego_wp = session.map.get_waypoint(ego.get_location(), project_to_road=True) if session.map else None
@@ -276,12 +313,66 @@ def advance_pass_fsm(
         long_cleared = clear_of_lead
         if hasattr(session, "ego_cleared_lead"):
             long_cleared = bool(session.ego_cleared_lead(merge_clear_m()))
-        # Merge only after longitudinal clearance AND centered on passing lane (vision/geometry).
-        merge_ready = (
-            long_cleared
-            and st.maneuver_started
-            and d_pass < width * 0.36
-            and shift >= width * 0.56
+        ego_s = None
+        if hasattr(session, "actor_travel_s"):
+            try:
+                ego_s = float(session.actor_travel_s("ego"))
+            except Exception:
+                ego_s = None
+        last_ego_s = getattr(session, "_pass_fsm_last_ego_s", None)
+        if ego_s is not None:
+            session._pass_fsm_last_ego_s = ego_s
+
+        # After lateral latch: stay in overtake until ahead of lead (shift can read 0 between lanes).
+        if lateral_latched and not long_cleared:
+            if st.maneuver_started and long_cleared:
+                st.phase = "merge_back"
+                st.ticks_in_phase = 0
+                st.target_lane_source = "return_lane"
+            return st
+
+        axis_stuck = (
+            not long_cleared
+            and ego_s is not None
+            and last_ego_s is not None
+            and abs(ego_s - float(last_ego_s)) < 0.25
+            and st.ticks_in_phase >= 4
+            and float(speed_mps) > 1.0
+        )
+        slipped_to_travel = (
+            not lateral_latched
+            and not long_cleared
+            and d_travel < width * 0.52
+            and d_pass > width * 0.48
+            and peak_shift < width * 0.35
+            and shift < width * 0.28
+        )
+        off_passing_corridor = (
+            not lateral_latched
+            and not long_cleared
+            and shift < width * 0.30
+            and d_pass > width * 0.55
+        )
+        between_lanes = (
+            not lateral_latched
+            and not long_cleared
+            and d_travel > width * 0.55
+            and d_pass > width * 0.55
+        )
+        corridor_lost = (
+            not lateral_latched and not long_cleared and min(d_travel, d_pass) > width * 1.02
+        )
+        if slipped_to_travel or off_passing_corridor or between_lanes or corridor_lost or axis_stuck:
+            st.phase = "lane_change"
+            st.ticks_in_phase = 0
+            st.target_lane_source = "passing_lane"
+            if hasattr(session, "_last_steer"):
+                session._last_steer = 0.0
+            return st
+        merge_ready = long_cleared and st.maneuver_started and (
+            d_pass < width * 0.42
+            or d_travel < width * 0.42
+            or shift >= width * 0.40
         )
         if merge_ready:
             st.phase = "merge_back"
@@ -292,14 +383,14 @@ def advance_pass_fsm(
         return st
 
     if st.phase == "merge_back":
-        if d_pass > width * 0.42 or shift < width * 0.48:
+        long_cleared = clear_of_lead
+        if hasattr(session, "ego_cleared_lead"):
+            long_cleared = bool(session.ego_cleared_lead(merge_clear_m()))
+        if not long_cleared and (d_pass > width * 0.42 or shift < width * 0.48):
             st.phase = "overtake"
             st.ticks_in_phase = 0
             st.target_lane_source = "passing_lane"
             return st
-        long_cleared = clear_of_lead
-        if hasattr(session, "ego_cleared_lead"):
-            long_cleared = bool(session.ego_cleared_lead(merge_clear_m()))
         head_ok = True
         if hasattr(session, "heading_error_to_travel_lane_deg"):
             try:
@@ -350,8 +441,13 @@ def pass_control_tick(
 
     if requested_action in ("wait", "follow_lead") and pass_in_progress and st.active:
         lateral_commit = st.maneuver_started or shift >= width * 0.12
+        latched = bool(getattr(session, "_pass_corridor_committed", False)) or float(
+            getattr(session, "_pass_peak_shift_m", 0.0)
+        ) >= width * 0.45
         if st.phase in ("lane_change", "overtake", "merge_back"):
-            if long_gap < critical_gap_m():
+            if long_gap < critical_gap_m() and not (
+                st.phase == "overtake" and (latched or lateral_commit)
+            ):
                 abort_pass(session, f"planner_wait_critical_gap_{long_gap:.1f}m")
                 return st, "wait", True
             if lateral_commit:
@@ -380,6 +476,20 @@ def pass_control_tick(
         return st, requested_action, False
 
     if requested_action == "pass" or pass_in_progress:
+        from perception.pass_geometry import pass_finish_active
+
+        long_cleared = clear_of_lead
+        if hasattr(session, "ego_cleared_lead"):
+            try:
+                long_cleared = bool(session.ego_cleared_lead(merge_clear_m()))
+            except Exception:
+                pass
+        if st.phase == "abort" and pass_finish_active(session, clear_of_lead=long_cleared):
+            st.active = True
+            st.phase = "overtake"
+            st.abort_reason = ""
+            st.ticks_in_phase = 0
+            st.target_lane_source = "passing_lane"
         if not st.active:
             begin_pass(session)
             st = get_pass_control_state(session)
@@ -419,6 +529,19 @@ def fsm_diagnostics(session, ego, st: PassControlState) -> Dict[str, Any]:
     except Exception:
         ego_lane_id = None
         ego_road_id = None
+    travel_head = 0.0
+    passing_head = 0.0
+    if ego is not None:
+        if hasattr(session, "heading_error_to_travel_lane_deg"):
+            try:
+                travel_head = float(session.heading_error_to_travel_lane_deg(ego))
+            except Exception:
+                pass
+        if hasattr(session, "heading_error_to_passing_lane_deg"):
+            try:
+                passing_head = float(session.heading_error_to_passing_lane_deg(ego))
+            except Exception:
+                pass
     return {
         **ids,
         "pass_fsm_phase": st.phase,
@@ -428,6 +551,10 @@ def fsm_diagnostics(session, ego, st: PassControlState) -> Dict[str, Any]:
         "lateral_offset_travel_m": round(d_travel, 3),
         "lateral_offset_passing_m": round(d_pass, 3),
         "expected_lane_width_m": round(width, 3),
+        "travel_heading_error_deg": round(travel_head, 2),
+        "passing_heading_error_deg": round(passing_head, 2),
+        "pass_corridor_committed": bool(getattr(session, "_pass_corridor_committed", False)),
+        "pass_peak_shift_m": round(float(getattr(session, "_pass_peak_shift_m", 0.0)), 3),
         "ego_lane_id": ego_lane_id,
         "ego_road_id": ego_road_id,
         "pass_control_active": st.active,

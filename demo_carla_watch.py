@@ -6,11 +6,13 @@ Watch the agentic closed loop in CARLA with ego + overhead video.
 
 
 
-Hero pass mode (recommended for final presentation):
+Hero pass mode (recommended for final presentation — full lane-change, overtake, merge-back):
 
-  python demo_carla_watch.py --hero-pass --scenario clear_safe_pass --policy autopass --urgency high
+  python demo_carla_watch.py --hero-pass --scenario clear_safe_pass_perception --policy autopass --urgency high
 
   python demo_carla_watch.py --hero-pass --scenario clear_safe_pass --policy no_pass
+
+  Use --fast for shorter iteration (no realtime video, fewer frames). Default is 40 execute steps.
 
 """
 
@@ -138,6 +140,7 @@ def run_agentic_carla_loop(
     max_steps: int,
     *,
     policy: str = "autopass",
+    max_planner_rounds: int = 12,
 ) -> dict:
 
     from visual_world import WorldState, spec_to_dict
@@ -239,7 +242,7 @@ def run_agentic_carla_loop(
 
         "max_drive_steps": max_steps,
 
-        "max_planner_rounds": 12,
+        "max_planner_rounds": max_planner_rounds,
 
         "perception_backend": "carla",
 
@@ -255,7 +258,8 @@ def run_agentic_carla_loop(
 
     final_state = init
 
-    for event in app.stream(init, config={"recursion_limit": 300}):
+    recursion_limit = max(450, int(max_steps) * 7 + 120)
+    for event in app.stream(init, config={"recursion_limit": recursion_limit}):
 
         for node_name, update in event.items():
 
@@ -455,7 +459,18 @@ def main() -> None:
 
     parser.add_argument("--out-dir", type=Path, default=Path("runs/carla_watch"))
 
-    parser.add_argument("--steps", type=int, default=40)
+    parser.add_argument(
+        "--steps",
+        type=int,
+        default=40,
+        help="Max closed-loop execute steps (planner/tool/critic cycles are extra)",
+    )
+
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="Faster iteration: no realtime video pacing, fewer subframes (hero-pass)",
+    )
 
     parser.add_argument("--ticks", type=int, default=10)
 
@@ -531,9 +546,24 @@ def main() -> None:
         print(f"  Output: {args.out_dir}\n")
         os.environ["AUTOPASS_CONTROL_MODE"] = "vehicle"
         os.environ.setdefault("AUTOPASS_EXECUTE_DT_S", "0.35")
-        os.environ.setdefault("AUTOPASS_VIDEO_REALTIME", "1")
-        os.environ.setdefault("AUTOPASS_DEMO_DENSE_FRAMES", "1")
-        run_agentic_carla_loop(spec, world, args.out_dir, args.ticks, args.steps, policy=args.policy)
+        if args.fast:
+            os.environ["AUTOPASS_VIDEO_REALTIME"] = "0"
+            os.environ["AUTOPASS_DEMO_DENSE_FRAMES"] = "0"
+            ticks = min(args.ticks, 6)
+            steps = args.steps
+        else:
+            os.environ.setdefault("AUTOPASS_VIDEO_REALTIME", "1")
+            os.environ.setdefault("AUTOPASS_DEMO_DENSE_FRAMES", "1")
+            ticks = args.ticks
+            steps = args.steps
+        run_agentic_carla_loop(
+            spec,
+            world,
+            args.out_dir,
+            ticks,
+            steps,
+            policy=args.policy,
+        )
         return
 
 

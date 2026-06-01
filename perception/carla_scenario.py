@@ -1205,6 +1205,39 @@ class CarlaScenarioSession:
             )
         return self._wp_on_lane_ahead(anchor, la, tw.lane_id, tw.road_id)
 
+    def align_ego_to_passing_lane(self, *, max_lateral_m: float = 5.5) -> bool:
+        """Snap ego onto the passing lane center at current longitudinal s (corridor geometry only)."""
+        ego = self.actors.get("ego")
+        pw = self._passing_wp
+        if ego is None or pw is None or self.map is None:
+            return False
+        anchor = self._passing_lane_anchor_at_ego(ego)
+        if anchor is None:
+            return False
+        from perception.carla_lane_keep import lane_center_distance_m
+
+        if lane_center_distance_m(ego.get_location(), anchor) > max_lateral_m:
+            return False
+        carla = self.carla
+        loc = anchor.transform.location
+        rot = anchor.transform.rotation
+        was_phys = bool(getattr(self, "_ego_physics", False))
+        if was_phys:
+            ego.set_simulate_physics(False)
+        ego.set_transform(
+            carla.Transform(
+                carla.Location(float(loc.x), float(loc.y), float(loc.z) + 0.25),
+                carla.Rotation(float(rot.pitch), float(rot.yaw), float(rot.roll)),
+            )
+        )
+        self._zero_vehicle_control(ego)
+        self._zero_actor_kinematics(ego)
+        self._last_steer = 0.0
+        if was_phys:
+            ego.set_simulate_physics(True)
+            self._zero_actor_kinematics(ego)
+        return True
+
     def align_ego_to_travel_lane(self, *, max_lateral_m: float = 2.5) -> bool:
         """Snap ego onto spawn travel lane center if map projection put it on an adjacent lane."""
         ego = self.actors.get("ego")
@@ -1433,8 +1466,17 @@ class CarlaScenarioSession:
                 return self._lane_change_steer_waypoint(ego, side)
             return self._merge_back_steer_waypoint(ego, side)
         if phase in ("approach", "prepare_pass", "lane_change", "overtake") and self._passing_wp is not None:
-            if phase == "overtake" and self.ego_on_passing_corridor(ego):
-                return self.get_passing_lane_steering_waypoint(ego, lookahead_m=6.5)
+            if phase == "overtake":
+                d_travel, d_pass, width = self.lateral_lane_offsets_m(ego)
+                w = max(2.5, float(width))
+                on_pass = self.ego_on_passing_corridor(ego)
+                latched = bool(getattr(self, "_pass_corridor_committed", False)) or float(
+                    getattr(self, "_pass_peak_shift_m", 0.0)
+                ) >= w * 0.45
+                corridor_ok = on_pass and float(d_pass) < w * 0.52 and float(d_travel) < w * 0.65
+                if corridor_ok or latched:
+                    la = 8.0 if latched else 6.5
+                    return self.get_passing_lane_steering_waypoint(ego, lookahead_m=la)
             return self._lane_change_steer_waypoint(ego, side)
         return self.get_travel_steering_waypoint(ego)
 

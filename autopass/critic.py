@@ -19,6 +19,21 @@ from visual_world import ScenarioSpec, WorldState
 CriticVerdict = Literal["ok", "insufficient", "reject", "replan"]
 
 
+def _pass_actuation_active() -> bool:
+    """True while CARLA pass FSM is driving lane-change / overtake / merge-back."""
+    try:
+        from perception.carla_scenario import get_session
+        from perception.pass_control_fsm import get_pass_control_state
+
+        session = get_session()
+        if not session.ready:
+            return False
+        st = get_pass_control_state(session)
+        return bool(st.active and st.phase not in ("idle", "abort"))
+    except Exception:
+        return False
+
+
 def critique_tool_result(
     dsl: PassingDSL,
     tool_name: str,
@@ -47,6 +62,18 @@ def critique_tool_result(
                 tool=tool_name,
             )
             return dsl.append_verification(note), "insufficient"
+        if _pass_actuation_active() and tool_name in (
+            "capture_sensors",
+            "measure_front_gap",
+            "measure_rear_gap",
+            "check_kinematics",
+        ):
+            note = VerificationNote(
+                verdict="ok",
+                message=f"Pass actuation active — keeping prior {tool_name} evidence ({redundant}).",
+                tool=tool_name,
+            )
+            return dsl.append_verification(note), "ok"
         dsl = dsl.invalidate_tool(tool_name, redundant)
         note = VerificationNote(verdict="reject", message=f"Redundant tool: {redundant}", tool=tool_name)
         return dsl.append_verification(note), "reject"
