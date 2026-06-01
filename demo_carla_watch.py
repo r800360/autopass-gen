@@ -130,7 +130,15 @@ def _record_session(
 
 
 
-def run_agentic_carla_loop(spec, world, out_dir: Path, ticks_per_step: int, max_steps: int) -> None:
+def run_agentic_carla_loop(
+    spec,
+    world,
+    out_dir: Path,
+    ticks_per_step: int,
+    max_steps: int,
+    *,
+    policy: str = "autopass",
+) -> dict:
 
     from visual_world import WorldState, spec_to_dict
 
@@ -225,7 +233,7 @@ def run_agentic_carla_loop(spec, world, out_dir: Path, ticks_per_step: int, max_
 
         "world": asdict(sim_world),
 
-        "policy": "autopass",
+        "policy": policy,
 
         "trace": [],
 
@@ -370,8 +378,7 @@ def run_agentic_carla_loop(spec, world, out_dir: Path, ticks_per_step: int, max_
 
     print(f"[CARLA] Frames: {recorder.frames_dir}")
 
-
-
+    return final_state
 
 
 def main() -> None:
@@ -526,7 +533,7 @@ def main() -> None:
         os.environ.setdefault("AUTOPASS_EXECUTE_DT_S", "1.0")
         os.environ.setdefault("AUTOPASS_VIDEO_REALTIME", "1")
         os.environ.setdefault("AUTOPASS_DEMO_DENSE_FRAMES", "1")
-        run_agentic_carla_loop(spec, world, args.out_dir, args.ticks, args.steps)
+        run_agentic_carla_loop(spec, world, args.out_dir, args.ticks, args.steps, policy=args.policy)
         return
 
 

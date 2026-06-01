@@ -102,6 +102,8 @@ def test_planner_runs_during_pass_in_progress_not_bypass():
 
 
 def test_enable_ego_physics_allowed_during_pass_validation():
+    from unittest.mock import call
+
     from perception.carla_scenario import CarlaScenarioSession
 
     session = CarlaScenarioSession()
@@ -109,7 +111,10 @@ def test_enable_ego_physics_allowed_during_pass_validation():
     session.actors["ego"] = MagicMock()
     session._pass_validation_in_progress = True
     session.enable_ego_physics(True)
-    session.actors["ego"].set_simulate_physics.assert_called_once_with(True)
+    # CARLA standard: disable physics → zero velocity → re-enable (anti-spin settle).
+    session.actors["ego"].set_simulate_physics.assert_any_call(False)
+    session.actors["ego"].set_simulate_physics.assert_any_call(True)
+    assert session.actors["ego"].set_simulate_physics.call_args_list[-1] == call(True)
 
 
 def test_lane_change_advances_on_lateral_shift():

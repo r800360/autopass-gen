@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from autopass.physics import _validate_carla_actors
 from perception.carla_control import _logical_collision
 from perception.carla_scenario import CarlaScenarioSession
@@ -84,6 +86,14 @@ def test_signed_projection_for_far_rear_not_zero():
     assert rear_signed is not None
     assert rear_signed < -70.0
     assert s.rear_longitudinal_gap_m() > 70.0
+
+
+def test_geometry_debug_snapshot_accepts_tuple_travel_origin():
+    s = _build_session()
+    s._travel_axis = lambda: ((-486.43, 196.72, 0.0), (0.0242, -0.9997, 0.0))
+    s.actors = {"ego": _Actor(_Loc(0.0, 0.0)), "lead": _Actor(_Loc(27.5, 0.0))}
+    snap = s.geometry_debug_snapshot()
+    assert snap["travel_origin"]["y"] == pytest.approx(196.72, abs=0.1)
 
 
 def test_projection_failure_returns_none_not_zero():

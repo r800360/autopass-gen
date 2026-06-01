@@ -127,7 +127,9 @@ class CarlaRecorder:
             return default_fps
         span = max(0.05, t1 - t0)
         derived = int(round((frame_count - 1) / span))
-        return max(20, min(24, derived))
+        if derived < 8:
+            return default_fps
+        return max(12, min(25, derived))
 
     def write_video(self, name: str = "run.mp4", fps: int | None = None) -> Optional[Path]:
         if self._index == 0:

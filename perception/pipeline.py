@@ -17,8 +17,13 @@ from visual_world import (
 )
 
 CAMERA_FOV_DEG = 90.0
-CAMERA_WIDTH_PX = 1280
-CAMERA_FOCAL_PX = CAMERA_WIDTH_PX / (2 * np.tan(np.radians(CAMERA_FOV_DEG / 2)))
+CAMERA_WIDTH_PX = 1280  # visual_world renderer default
+
+
+def camera_focal_px(image_width: float, fov_deg: float = CAMERA_FOV_DEG) -> float:
+    """Pinhole focal length in pixels for the given sensor width (CARLA ego cam is 640px)."""
+    w = max(1.0, float(image_width))
+    return w / (2 * np.tan(np.radians(fov_deg / 2)))
 
 
 def _acquire_frame(spec: ScenarioSpec, world: WorldState) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -223,7 +228,8 @@ def capture_multi_frame_perception(
     valid_lengths = []
     for bbox_w, depth in front_bboxes:
         if bbox_w > 0 and depth > 0:
-            real_width = (bbox_w / CAMERA_FOCAL_PX) * depth
+            focal_px = camera_focal_px(image_width)
+            real_width = (bbox_w / focal_px) * depth
             valid_lengths.append(float(np.clip(real_width * CAR_LENGTH_TO_WIDTH_RATIO, 2.0, 20.0)))
     front_car_length = float(np.median(valid_lengths)) if valid_lengths else 4.5
 
