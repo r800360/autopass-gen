@@ -908,6 +908,15 @@ class CarlaScenarioSession:
             return 0.0
         d_travel, d_pass, width = self.lateral_lane_offsets_m(ego)
         w = max(2.5, float(width))
+        try:
+            from perception.pass_control_fsm import get_pass_control_state
+
+            phase = str(get_pass_control_state(self).phase or "")
+        except Exception:
+            phase = ""
+        if phase == "merge_back":
+            # Axis-ahead merge can start with huge d_pass; bias steering to travel immediately.
+            return min(1.0, max(0.55, 0.55 + float(d_travel) / (w * 2.2)))
         if float(d_pass) > w * 0.38:
             return 0.0
         return min(1.0, max(0.0, 1.0 - float(d_travel) / w))
@@ -1467,8 +1476,12 @@ class CarlaScenarioSession:
             return self._merge_back_steer_waypoint(ego, side)
         if phase in ("approach", "prepare_pass", "lane_change", "overtake") and self._passing_wp is not None:
             if phase == "overtake":
+                from perception.pass_geometry import axis_ahead_of_lead, pass_merge_back_due
+
                 d_travel, d_pass, width = self.lateral_lane_offsets_m(ego)
                 w = max(2.5, float(width))
+                if pass_merge_back_due(self) or axis_ahead_of_lead(self) or float(d_pass) > w * 0.55:
+                    return self._merge_back_steer_waypoint(ego, side)
                 on_pass = self.ego_on_passing_corridor(ego)
                 latched = bool(getattr(self, "_pass_corridor_committed", False)) or float(
                     getattr(self, "_pass_peak_shift_m", 0.0)
@@ -2460,8 +2473,30 @@ class CarlaScenarioSession:
                     pass
             if name == "rear" and self.rear_longitudinal_gap_m() >= rear_follow_min_m() - 1.0:
                 continue
-            if name == "lead" and self.lead_longitudinal_gap_m() >= 5.0:
-                continue
+            if name == "lead":
+                if self.lead_longitudinal_gap_m() >= 5.0:
+                    continue
+                try:
+                    from perception.pass_geometry import (
+                        axis_ahead_of_lead,
+                        pass_finish_active,
+                    )
+
+                    if (
+                        pass_finish_active(self)
+                        or axis_ahead_of_lead(self)
+                    ) and ego_wp is not None:
+                        actor_wp = self.map.get_waypoint(
+                            actor.get_location(), project_to_road=True
+                        )
+                        if (
+                            actor_wp is not None
+                            and int(ego_wp.lane_id) != int(actor_wp.lane_id)
+                            and d >= 2.0
+                        ):
+                            continue
+                except Exception:
+                    pass
             return True, f"{name}_within_{d:.1f}m"
         return False, ""
 

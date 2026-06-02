@@ -310,9 +310,20 @@ def advance_pass_fsm(
         return st
 
     if st.phase == "overtake":
+        from perception.pass_geometry import axis_ahead_of_lead, pass_merge_back_due
+
         long_cleared = clear_of_lead
         if hasattr(session, "ego_cleared_lead"):
             long_cleared = bool(session.ego_cleared_lead(merge_clear_m()))
+        ahead_axis = axis_ahead_of_lead(session)
+        if pass_merge_back_due(session) or (
+            lateral_latched and st.maneuver_started and (long_cleared or ahead_axis)
+        ):
+            st.phase = "merge_back"
+            st.ticks_in_phase = 0
+            st.target_lane_source = "return_lane"
+            return st
+
         ego_s = None
         if hasattr(session, "actor_travel_s"):
             try:
@@ -322,14 +333,6 @@ def advance_pass_fsm(
         last_ego_s = getattr(session, "_pass_fsm_last_ego_s", None)
         if ego_s is not None:
             session._pass_fsm_last_ego_s = ego_s
-
-        # After lateral latch: stay in overtake until ahead of lead (shift can read 0 between lanes).
-        if lateral_latched and not long_cleared:
-            if st.maneuver_started and long_cleared:
-                st.phase = "merge_back"
-                st.ticks_in_phase = 0
-                st.target_lane_source = "return_lane"
-            return st
 
         axis_stuck = (
             not long_cleared
@@ -383,10 +386,22 @@ def advance_pass_fsm(
         return st
 
     if st.phase == "merge_back":
+        from perception.pass_geometry import axis_ahead_of_lead
+
         long_cleared = clear_of_lead
         if hasattr(session, "ego_cleared_lead"):
             long_cleared = bool(session.ego_cleared_lead(merge_clear_m()))
-        if not long_cleared and (d_pass > width * 0.42 or shift < width * 0.48):
+        ahead_axis = axis_ahead_of_lead(session)
+        if ahead_axis:
+            long_cleared = True
+        committed = lateral_latched or bool(getattr(session, "_pass_corridor_committed", False))
+        # Wide lateral offsets are expected right after axis-ahead merge trigger — do not bounce to overtake.
+        if (
+            not committed
+            and not ahead_axis
+            and not long_cleared
+            and (d_pass > width * 0.42 or shift < width * 0.48)
+        ):
             st.phase = "overtake"
             st.ticks_in_phase = 0
             st.target_lane_source = "passing_lane"
@@ -394,11 +409,15 @@ def advance_pass_fsm(
         head_ok = True
         if hasattr(session, "heading_error_to_travel_lane_deg"):
             try:
-                head_ok = abs(float(session.heading_error_to_travel_lane_deg(ego))) < 22.0
+                head_ok = abs(float(session.heading_error_to_travel_lane_deg(ego))) < 28.0
             except Exception:
                 head_ok = True
-        aligned = d_travel < 0.65 and head_ok
-        if (clear_of_lead or long_cleared) and aligned:
+        if committed or ahead_axis:
+            aligned = d_travel < width * 0.72 and head_ok
+        else:
+            aligned = d_travel < 0.65 and head_ok
+        still_wide = d_travel > width * 0.85 or d_pass > width * 0.85
+        if (clear_of_lead or long_cleared) and aligned and not still_wide:
             st.active = False
             st.phase = "idle"
         elif st.ticks_in_phase > 200 and d_travel < 0.85 and head_ok:

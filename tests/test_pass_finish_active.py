@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 from perception.carla_validation import _validate_carla_actors
 from perception.pass_control_fsm import abort_pass, check_multi_lane_departure, get_pass_control_state
-from perception.pass_geometry import pass_finish_active, pass_geometry_exempt
+from perception.pass_geometry import axis_ahead_of_lead, pass_finish_active, pass_geometry_exempt, pass_merge_back_due
 
 
 def test_pass_finish_active_after_abort():
@@ -55,6 +55,51 @@ def test_multi_lane_departure_skipped_while_finishing():
     departed, reason = check_multi_lane_departure(session, ego)
     assert departed is False
     assert reason == ""
+
+
+def test_pass_finish_active_during_merge_back_when_axis_ahead():
+    session = SimpleNamespace(
+        ready=True,
+        _pass_corridor_committed=True,
+        _pass_peak_shift_m=3.2,
+        expected_passing_lane_width_m=lambda: 3.5,
+        ego_cleared_lead=lambda c: False,
+        actor_travel_s=lambda name: 36.0 if name == "ego" else 32.0,
+    )
+    st = get_pass_control_state(session)
+    st.active = True
+    st.maneuver_started = True
+    st.phase = "merge_back"
+    assert axis_ahead_of_lead(session, margin_m=3.0) is True
+    assert pass_finish_active(session) is True
+    assert pass_finish_active(session, clear_of_lead=True) is False
+
+
+def test_pass_merge_back_due_on_axis_ahead():
+    from perception.pass_geometry import pass_merge_back_due
+
+    session = SimpleNamespace(
+        ready=True,
+        _pass_corridor_committed=True,
+        _pass_peak_shift_m=3.2,
+        expected_passing_lane_width_m=lambda: 3.5,
+        ego_cleared_lead=lambda c: False,
+        actor_travel_s=lambda name: 36.0 if name == "ego" else 32.0,
+    )
+    st = get_pass_control_state(session)
+    st.active = True
+    st.maneuver_started = True
+    st.phase = "overtake"
+    assert pass_merge_back_due(session) is True
+
+
+def test_axis_ahead_of_lead():
+    session = SimpleNamespace(
+        ready=True,
+        actor_travel_s=lambda name: 36.0 if name == "ego" else 32.0,
+    )
+    assert axis_ahead_of_lead(session, margin_m=3.0) is True
+    assert axis_ahead_of_lead(session, margin_m=5.0) is False
 
 
 def test_adjacent_lane_lead_not_too_close_when_beside():

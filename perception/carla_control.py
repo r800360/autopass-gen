@@ -32,12 +32,29 @@ PassPhase = Literal["cruise", "approach", "lane_change", "overtake", "merge"]
 
 
 def _session_cleared_of_lead(session) -> bool:
+    """Full longitudinal clearance (8 m axis-ahead of lead), not the 3 m merge trigger."""
     from perception.carla_pass_maneuver import merge_clearance_m
 
     clearance = merge_clearance_m()
     if hasattr(session, "ego_cleared_lead"):
         return bool(session.ego_cleared_lead(clearance))
     return bool(session.ego_clear_of_lead(clearance))
+
+
+def _sync_pass_fsm_for_merge(session, ego, pass_st) -> None:
+    """Ensure FSM reflects merge-back once ego is axis-ahead of the lead."""
+    from perception.pass_geometry import pass_merge_back_due
+
+    if pass_st is None or ego is None or not pass_st.active:
+        return
+    if pass_st.phase not in ("overtake", "lane_change"):
+        return
+    if not pass_merge_back_due(session):
+        return
+    pass_st.phase = "merge_back"
+    pass_st.ticks_in_phase = 0
+    pass_st.target_lane_source = "return_lane"
+    pass_st.maneuver_started = True
 
 
 def _speed_mps(velocity) -> float:
@@ -476,6 +493,12 @@ def build_vehicle_control(
         }
         no_steer_penalty = True
     elif scripted_phase == "overtake":
+        from perception.pass_geometry import pass_merge_back_due
+
+        merge_due = session is not None and pass_merge_back_due(session)
+        if merge_due:
+            scripted_phase = "merge_back"
+            pass_fsm_phase = "merge_back"
         latch_w = 3.5
         if session is not None and hasattr(session, "expected_passing_lane_width_m"):
             latch_w = float(session.expected_passing_lane_width_m())
@@ -536,11 +559,14 @@ def build_vehicle_control(
         ):
             _dt, d_pass, width = session.lateral_lane_offsets_m(ego)
             if float(d_pass) > float(width) * 0.75:
+                scripted_phase = "merge_back"
+                pass_fsm_phase = "merge_back"
                 steer_kw = {
-                    "lateral_gain_mult": 1.05,
-                    "lookahead_mult": 0.62,
-                    "max_delta": 0.032,
-                    "max_steer_override": min(0.14, max_steer()),
+                    "lateral_gain_mult": 1.25,
+                    "lookahead_mult": 0.48,
+                    "max_delta": 0.035,
+                    "max_steer_override": min(0.26, max_steer() * 1.3),
+                    "smooth_mult": 0.58,
                 }
         if (
             not on_passing_corridor
@@ -549,12 +575,14 @@ def build_vehicle_control(
             and hasattr(session, "lateral_overshoot_past_passing_m")
             and float(session.lateral_overshoot_past_passing_m(ego)) > 0.15
         ):
+            scripted_phase = "merge_back"
+            pass_fsm_phase = "merge_back"
             steer_kw = {
-                "lateral_gain_mult": 0.62,
-                "lookahead_mult": 0.58,
-                "max_delta": 0.022,
-                "max_steer_override": min(0.11, max_steer()),
-                "smooth_mult": 0.5,
+                "max_steer_override": min(0.28, max_steer() * 1.35),
+                "lateral_gain_mult": 1.35,
+                "lookahead_mult": 0.45,
+                "max_delta": 0.035,
+                "smooth_mult": 0.58,
             }
     head_err = 0.0
     lat_err = 0.0
@@ -1056,7 +1084,7 @@ def execute_vehicle_step(
                 pass
         critical_close = along_lead < critical_gap_m() and not clear_of_lead
         corridor_lost = between_lanes_geom or lane_dist > width * 2.05
-        if pass_st.active and pass_st.phase in ("lane_change", "overtake") and (
+        if pass_st.active and pass_st.phase in ("lane_change", "overtake", "merge_back") and (
             pass_latched or pass_st.maneuver_started
         ):
             corridor_lost = False
@@ -1176,6 +1204,7 @@ def execute_vehicle_step(
     ctrl = last_ctrl
     measured_speed = float(sum(speeds) / len(speeds)) if speeds else world.ego_speed_mps
     progress_delta = measured_speed * duration_s
+    _sync_pass_fsm_for_merge(session, ego, pass_st)
     clear_of_lead = _session_cleared_of_lead(session)
     ego_lane = session.infer_ego_lane_index()
     travel_lane_id = int(session._travel_wp.lane_id) if session._travel_wp else None
@@ -1196,6 +1225,8 @@ def execute_vehicle_step(
     )
     passed = world.passed or passed_now
 
+    from perception.pass_geometry import axis_ahead_of_lead, pass_finish_active
+
     collision, collision_detail = session.check_actor_proximity(threshold_m=4.2)
     collision_source = ""
     if collision:
@@ -1204,6 +1235,14 @@ def execute_vehicle_step(
             collision = False
             collision_detail = ""
             collision_source = "ignored_spawn_grace"
+        elif collision_detail.startswith("lead_") and (
+            pass_finish_active(session)
+            or pass_st.phase == "merge_back"
+            or axis_ahead_of_lead(session)
+        ):
+            collision = False
+            collision_detail = ""
+            collision_source = ""
     near_miss = _near_miss_this_step(
         session,
         min_front,
@@ -1390,16 +1429,30 @@ def _logical_collision(
     session=None,
 ) -> Tuple[bool, str]:
     if session is not None and getattr(session, "ready", False):
+        from perception.pass_geometry import axis_ahead_of_lead, pass_finish_active
+
         gaps_3d = session.measure_actor_gaps_3d()
         lead_signed = session.signed_gap_from_ego("lead") if hasattr(session, "signed_gap_from_ego") else None
         rear_signed = session.signed_gap_from_ego("rear") if hasattr(session, "signed_gap_from_ego") else None
         on_signed = session.signed_gap_from_ego("oncoming") if hasattr(session, "signed_gap_from_ego") else None
+        pass_exempt = pass_finish_active(session) or axis_ahead_of_lead(session)
 
         # In CARLA mode, never infer overlap from missing projection.
-        if ego_lane == 0 and not passed and lead_signed is not None and gaps_3d.get("front", 999.0) < 12.0:
+        if (
+            not pass_exempt
+            and ego_lane == 0
+            and not passed
+            and lead_signed is not None
+            and gaps_3d.get("front", 999.0) < 12.0
+        ):
             if abs(float(lead_signed)) < 4.0:
                 return True, "lead_proximity_logical"
-        if ego_lane == 0 and rear_signed is not None and gaps_3d.get("rear", 999.0) < 12.0:
+        if (
+            not pass_exempt
+            and ego_lane == 0
+            and rear_signed is not None
+            and gaps_3d.get("rear", 999.0) < 12.0
+        ):
             if abs(float(rear_signed)) < 4.0:
                 return True, "rear_proximity_logical"
         if ego_lane == 1 and on_signed is not None and gaps_3d.get("oncoming", 999.0) < 14.0:
