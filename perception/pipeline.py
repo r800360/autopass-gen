@@ -269,12 +269,7 @@ def capture_multi_frame_perception(
         from perception.carla_scenario import get_session
 
         session = get_session()
-        if (
-            session.ready
-            and spec is not None
-            and session.allows_pre_decision_actor_layout()
-        ):
-            session.restore_lead_spawn_longitudinal_gap(spec)
+        # Lead layout is fixed at bootstrap — restoring here teleports the lead on camera between bursts.
         if session.ready and last_depth_result is not None:
             try:
                 from autopass.perception_state import classify_car_distances

@@ -11,12 +11,14 @@ SCENARIO_ENVIRONMENTS: Dict[str, Tuple[str, str]] = {
     "highway": ("Town04", "highway"),
     "town": ("Town03", "urban"),
     "local": ("Town01", "local"),
+    "suburban": ("Town02", "suburban"),
+    "multilane": ("Town05", "multilane_highway"),
 }
 
 # Stable showcase map for final CARLA video / benchmark evidence.
 CURATED_SHOWCASE_MAP = "Town04"
-VALIDATED_CARLA_ENVIRONMENTS = frozenset({"highway", "synthetic"})
-UNVALIDATED_CARLA_ENVIRONMENTS = frozenset({"town", "local"})
+VALIDATED_CARLA_ENVIRONMENTS = frozenset({"highway", "synthetic", "multilane"})
+UNVALIDATED_CARLA_ENVIRONMENTS = frozenset({"town", "local", "suburban"})
 
 
 def scenario_kind_for_index(index: int) -> str:
@@ -63,7 +65,7 @@ def assert_carla_environment_allowed(environment: str) -> None:
 
 def showcase_map_for_environment(environment: str) -> str:
     """Map used for curated CARLA showcase; highway defaults to Town04."""
-    if environment == "highway" or environment == "synthetic":
+    if environment in ("highway", "synthetic"):
         return CURATED_SHOWCASE_MAP
     return carla_map_for_kind(environment)
 

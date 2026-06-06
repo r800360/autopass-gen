@@ -22,18 +22,25 @@ DEFAULT_BEHIND_M = 40.0
 DEFAULT_MAX_YAW_DELTA_DEG = 12.0
 TRAFFIC_CONTROL_RADIUS_M = 28.0
 
-MANEUVER_HORIZON_PRESENTATION_M = 65.0
-MANEUVER_HORIZON_HERO_M = 60.0
+MANEUVER_HORIZON_PRESENTATION_M = 100.0
+MANEUVER_HORIZON_HERO_M = 90.0
 
 # Hand-curated spawn indices per map (tried before automatic scan when scan fails).
 # Add indices discovered via: python -m perception.carla_corridor_smoke --diagnose --top-k 10
 CURATED_CORRIDOR_CANDIDATES: Dict[str, List[int]] = {
-    "Town04": [],
-    "Town03": [],
-    "Town05": [],
+    # Town04 road 6: spawn 141 (lane 5) — 200m forward straight, validated passing corridor.
+    "Town04": [141, 140],
+    # Town01 road 4 / road 10: long straight two-lane roads with passing lane.
+    "Town01": [2, 4, 9, 12, 16, 19],
+    # Town02 road 12: good straight segments.
+    "Town02": [19, 21, 27, 29, 34],
+    # Town03: limited options, road 67.
+    "Town03": [170],
+    # Town05: multi-lane highway-style roads.
+    "Town05": [144, 155, 159, 161, 179],
 }
 
-SCAN_MAP_PRIORITY: Tuple[str, ...] = ("Town04", "Town05", "Town03")
+SCAN_MAP_PRIORITY: Tuple[str, ...] = ("Town04", "Town01", "Town05", "Town02", "Town03")
 
 _MODE_PARAMS: Dict[str, Dict[str, float]] = {
     "strict": {
@@ -438,7 +445,9 @@ def near_miss_score(report: CorridorReport, issues: Sequence[str]) -> float:
     score -= report.junction_count_in_horizon * 25.0
     score -= report.traffic_light_count * 15.0
     score -= report.stop_control_count * 12.0
-    score -= report.heading_change_deg * 0.4
+    # Penalize curves harder — lane-change geometry is unstable on tight bends.
+    yaw_pen = 1.2 if report.validation_mode in ("presentation", "hero") else 0.4
+    score -= report.heading_change_deg * yaw_pen
     score -= len(issues) * 3.0
     return score
 

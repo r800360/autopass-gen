@@ -20,7 +20,7 @@ def corridor_merge_horizon_m() -> float:
 
 
 def lane_change_steer_cap_mult() -> float:
-    return _f("LANE_CHANGE_STEER_CAP_MULT", 1.45)
+    return _f("LANE_CHANGE_STEER_CAP_MULT", 0.95)
 
 
 def lane_change_lateral_mult() -> float:

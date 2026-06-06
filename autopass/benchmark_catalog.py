@@ -19,6 +19,20 @@ FAMILY_TO_DEMO_ID: Dict[str, str] = {
     "slow_lead_high_urgency": "demo_06_medium_safe_selective_pass",
     "clear_safe_pass_perception": "demo_07_clear_safe_pass_perception",
     "repeated_blockage_or_replan": "demo_03_occluded_boundary_replan",
+    "urgent_wide_lead_pass": "demo_08_urgent_wide_lead_pass",
+    "oncoming_borderline_wait": "demo_09_oncoming_borderline_wait",
+    "heavy_rain_occluded": "demo_10_heavy_rain_occluded",
+    "fast_lead_convoy_pass": "demo_11_fast_lead_convoy_pass",
+    "tight_rear_closing": "demo_12_tight_rear_closing",
+    "dense_fog_selective_pass": "demo_13_dense_fog_selective_pass",
+    "noisy_sensors_safe_pass": "demo_14_noisy_sensors_safe_pass",
+    "extreme_deadline_pass": "demo_15_extreme_deadline_pass",
+    "crawler_lead_urgent": "demo_16_crawler_lead_urgent",
+    "medium_urgency_balanced": "demo_17_medium_urgency_balanced",
+    "oncoming_far_confident_pass": "demo_18_oncoming_far_confident_pass",
+    "wet_highway_pass": "demo_19_wet_highway_pass",
+    "rear_distant_safe_pass": "demo_20_rear_distant_safe_pass",
+    "partial_occlusion_replan": "demo_21_partial_occlusion_replan",
 }
 
 URGENCY_REQUEST: Dict[UrgencyLevel, str] = {

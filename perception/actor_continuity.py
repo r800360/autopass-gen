@@ -54,6 +54,15 @@ def mark_closed_loop_actuation_begun(session) -> None:
     session._last_layout_transform_reason = None
     already = bool(getattr(session, "_closed_loop_actuation_begun", False))
     session._closed_loop_actuation_begun = True
+    spec = getattr(session, "_bootstrap_spec", None)
+    if spec is not None and float(getattr(session, "_kinematic_lead_speed_mps", 0.0)) < 0.5:
+        try:
+            profile = session._spawn_profile(spec)
+            session._kinematic_lead_speed_mps = float(
+                profile.get("lead_speed_mps", spec.lead.speed_mps)
+            )
+        except Exception:
+            pass
     if already and getattr(session, "_actuation_hold_lead_transform", None) is not None:
         return
     lead = session.actors.get("lead") if getattr(session, "actors", None) else None

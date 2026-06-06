@@ -14,16 +14,9 @@ except ImportError:
 
 
 def _draw_hud(rgb: np.ndarray, lines: List[str]) -> np.ndarray:
-    if Image is None:
-        return rgb
-    img = Image.fromarray(rgb)
-    draw = ImageDraw.Draw(img)
-    y = 8
-    for line in lines:
-        draw.rectangle([4, y - 2, 4 + 8 * len(line), y + 14], fill=(0, 0, 0))
-        draw.text((8, y), line, fill=(255, 255, 0))
-        y += 18
-    return np.array(img)
+    from perception.vision_demo_overlay import compose_demo_frame
+
+    return compose_demo_frame(rgb, hud_lines=lines, classified=None, draw_boxes=False)
 
 
 def _stack_views(ego: np.ndarray, overhead: Optional[np.ndarray]) -> np.ndarray:
@@ -52,6 +45,7 @@ class CarlaRecorder:
         self._index = 0
         self._display_t_s = 0.0
         self._last_graph_t_s = -1.0
+        self._last_capture_key: Optional[tuple] = None
 
     def next_display_t_s(self, graph_t_s: float, *, label: str) -> float:
         """
@@ -97,10 +91,45 @@ class CarlaRecorder:
                 lines.append(f"sim_t={float(graph_t):.2f}s")
         if graph_step is not None:
             lines.append(f"step={graph_step}")
+        classified = None
+        vision_overlay = bool(extra and extra.get("vision_overlay"))
         if extra:
+            belief = extra.get("belief_panel")
+            if isinstance(belief, dict):
+                from autopass.demo_belief_panel import belief_panel_hud_lines
+
+                lines.extend(belief_panel_hud_lines(belief))
+            classified = extra.get("vision_detections")
             for k, v in list(extra.items())[:5]:
+                if k in ("belief_panel", "vision_detections", "graph_t_s", "vision_overlay"):
+                    continue
                 lines.append(f"{k}: {v}")
-        hud = _draw_hud(rgb, lines)
+        if classified is None and vision_overlay:
+            try:
+                from perception.carla_scenario import get_session
+                from perception.vision_demo_overlay import classify_detections_from_session
+
+                session = get_session()
+                if session.ready:
+                    classified = classify_detections_from_session(session)
+            except Exception:
+                classified = None
+        import os
+
+        dup_key = (label, round(float(t_s), 2), extra.get("graph_step") if extra else None)
+        if os.environ.get("AUTOPASS_SKIP_STAGNANT_FRAMES", "1").strip() in ("1", "true", "yes"):
+            if dup_key == self._last_capture_key and label.upper().startswith("EXECUTE"):
+                return
+        self._last_capture_key = dup_key
+
+        from perception.vision_demo_overlay import compose_demo_frame
+
+        hud = compose_demo_frame(
+            rgb,
+            hud_lines=lines,
+            classified=classified if vision_overlay else None,
+            draw_boxes=vision_overlay,
+        )
         composite = _stack_views(hud, overhead)
         path = self.frames_dir / f"frame_{self._index:05d}.png"
         Image.fromarray(composite).save(path)

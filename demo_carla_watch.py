@@ -141,6 +141,7 @@ def run_agentic_carla_loop(
     *,
     policy: str = "autopass",
     max_planner_rounds: int = 12,
+    mission_urgency: str | None = None,
 ) -> dict:
 
     from visual_world import WorldState, spec_to_dict
@@ -230,6 +231,9 @@ def run_agentic_carla_loop(
 
     app = build_agentic_graph()
 
+    from autopass.demo_belief_panel import build_demo_belief_panel
+    from autopass.dsl import dsl_from_dict
+
     init = {
 
         "spec": spec_to_dict(spec),
@@ -249,6 +253,8 @@ def run_agentic_carla_loop(
         "control_mode": os.environ.get("AUTOPASS_CONTROL_MODE", "vehicle"),
 
     }
+    if mission_urgency in ("low", "medium", "high"):
+        init["mission_urgency"] = mission_urgency
 
     os.environ.setdefault("AUTOPASS_VIDEO_REALTIME", "1")
 
@@ -275,7 +281,22 @@ def run_agentic_carla_loop(
 
                 continue
 
-            extra = {}
+            extra = {"vision_overlay": True}
+            trace_list = update.get("trace") or final_state.get("trace") or []
+            trace_tail = trace_list[-1] if trace_list else {}
+            if trace_tail.get("node") != node_name:
+                trace_tail = {**trace_tail, "node": node_name}
+            try:
+                dsl_now = dsl_from_dict(final_state.get("dsl") or init.get("dsl") or {})
+                extra["belief_panel"] = build_demo_belief_panel(
+                    spec,
+                    sim_world,
+                    dsl_now,
+                    node_label=node_name.upper(),
+                    trace_tail=trace_tail,
+                )
+            except Exception:
+                pass
 
             if node_name == "planner" and update.get("last_tool"):
 
@@ -523,6 +544,11 @@ def main() -> None:
             os.environ.setdefault("AUTOPASS_CARLA_MAX_CORRIDOR_REPICK", "0")
             spec = curated_demo_scenarios()[6]
             spec = replace(spec, route=replace(spec.route, town=map_name))
+            if args.urgency == "high":
+                spec = replace(
+                    spec,
+                    request=replace(spec.request, deadline_s=min(spec.request.deadline_s, 16.0)),
+                )
             family = "clear_safe_pass_perception"
         else:
             from autopass.benchmark_catalog import FAMILY_TO_DEMO_ID
@@ -555,7 +581,7 @@ def main() -> None:
             os.environ.setdefault("AUTOPASS_VIDEO_REALTIME", "1")
             os.environ.setdefault("AUTOPASS_DEMO_DENSE_FRAMES", "1")
             ticks = args.ticks
-            steps = args.steps
+            steps = 22 if use_axis_demo else args.steps
         run_agentic_carla_loop(
             spec,
             world,
@@ -563,6 +589,7 @@ def main() -> None:
             ticks,
             steps,
             policy=args.policy,
+            mission_urgency=args.urgency,
         )
         return
 

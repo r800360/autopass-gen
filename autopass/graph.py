@@ -25,6 +25,29 @@ from autopass.tools import run_tool
 from visual_world import ScenarioSpec, WorldState, dict_to_spec, initialize_world, spec_to_dict
 
 
+def _pass_in_progress_active(state: AgenticState) -> bool:
+    """Graph pass flag or live CARLA FSM (mid-maneuver gates must stay latched)."""
+    if bool(state.get("pass_in_progress", False)):
+        return True
+    try:
+        from perception.carla_scenario import get_session
+        from perception.pass_control_fsm import get_pass_control_state
+
+        session = get_session()
+        if session.ready:
+            pst = get_pass_control_state(session)
+            if pst.active and pst.maneuver_started and pst.phase in (
+                "prepare_pass",
+                "lane_change",
+                "overtake",
+                "merge_back",
+            ):
+                return True
+    except Exception:
+        pass
+    return False
+
+
 class AgenticState(TypedDict, total=False):
     spec: Dict[str, Any]
     world: Dict[str, Any]
@@ -70,10 +93,19 @@ def _dsl(state: AgenticState) -> PassingDSL:
 def node_init_mission(state: AgenticState) -> Dict[str, Any]:
     spec = _spec(state)
     world = _world(state)
-    u = urgency_level(spec, world)
-    aggression = "high" if u == "high" else "low"
+    override = state.get("mission_urgency")
+    if override in ("low", "medium", "high"):
+        u = str(override)
+    else:
+        u = urgency_level(spec, world)
     if state.get("policy") == "no_pass":
         aggression = "0"
+    elif u == "high":
+        aggression = "high"
+    elif u == "medium":
+        aggression = "medium"
+    else:
+        aggression = "low"
     road = getattr(spec.route, "town", "highway")
     road_type = "highway" if "Town04" in str(road) or "Synthetic" in str(road) else (
         "urban" if "Town03" in str(road) else "local"
@@ -119,7 +151,7 @@ def node_planner(state: AgenticState) -> Dict[str, Any]:
     if rounds > state.get("max_planner_rounds", 12) * 4:
         return {"phase": "done", "planner_rounds": rounds, "trace": trace}
 
-    pass_active = bool(state.get("pass_in_progress", False))
+    pass_active = _pass_in_progress_active(state)
     insufficient = dict(state.get("insufficient_counts_by_tool", {}))
     mf_streak = int(state.get("measure_front_insufficient_streak", 0))
     unresolved = int(state.get("unresolved_front_resense_count", 0))
@@ -360,7 +392,7 @@ def node_critique_maneuver(state: AgenticState) -> Dict[str, Any]:
         spec,
         world,
         summary=perception_summary(dsl),
-        pass_in_progress=bool(state.get("pass_in_progress", False)),
+        pass_in_progress=_pass_in_progress_active(state),
     )
     trace.append(
         {
@@ -395,20 +427,24 @@ def node_critique_maneuver(state: AgenticState) -> Dict[str, Any]:
 def _pass_maneuver_complete(world_after: WorldState, feedback: Dict[str, Any]) -> bool:
     if world_after.passed:
         return True
-    if not feedback.get("pass_maneuver_started"):
-        return False
+    # Classic completion: clear of lead + back in travel lane.
+    clear = feedback.get("clear_of_lead", False)
+    ego_lane = feedback.get("ego_lane", world_after.ego_lane)
+    if clear and int(ego_lane) == 0:
+        return True
+    if clear and feedback.get("pass_phase") in ("cruise",):
+        return True
+    # FSM completed merge_back (phase=idle) while still clear of lead.
+    fsm_phase = feedback.get("pass_fsm_phase", "")
+    if fsm_phase == "idle" and clear and feedback.get("pass_maneuver_started"):
+        return True
+    # Mid-maneuver — not done yet.
     if feedback.get("pass_fsm_active"):
         return False
-    if not feedback.get("clear_of_lead"):
+    if not feedback.get("pass_maneuver_started"):
         return False
-    travel_lane_id = feedback.get("travel_lane_id")
-    ego_lane_id = feedback.get("ego_lane_id", feedback.get("ego_lane"))
-    if travel_lane_id is not None and ego_lane_id is not None:
-        return int(ego_lane_id) == int(travel_lane_id)
-    if feedback.get("ego_lane", world_after.ego_lane) == 0:
-        return True
-    if feedback.get("pass_phase") in ("merge", "cruise"):
-        return True
+    if not clear:
+        return False
     return False
 
 
@@ -423,7 +459,7 @@ def node_execute(state: AgenticState) -> Dict[str, Any]:
     policy = state.get("policy", "autopass")
     approved = state.get("approved_maneuver", "wait")
     action = clamp_maneuver_for_policy(policy, approved)
-    pass_active = bool(state.get("pass_in_progress", False))
+    pass_active = _pass_in_progress_active(state)
     if approved == "pass" and not pass_active:
         pass_active = True
     # Do not override planner/critic wait with forced pass — executor handles safe abort/hold.
@@ -619,16 +655,18 @@ def node_evaluate(state: AgenticState) -> Dict[str, Any]:
     trace = state.get("trace", [])
     passes = count_pass_maneuver_starts(trace)
     rejects = sum(1 for t in trace if t.get("verdict") == "reject" or t.get("post_verdict") == "replan")
-    route_ok = world.ego_x_m >= spec.route.goal_x_m and not world.collision
+    route_ok = (world.ego_x_m >= spec.route.goal_x_m or world.passed) and not world.collision
     exec_outcomes = [t.get("execution_outcome") for t in trace if t.get("node") == "execute"]
+    # Also treat "passed" flag set mid-episode as a route success if no collision.
+    physical_pass_success = world.passed and not world.collision
     if world.collision:
         failure = "collision"
     elif any(o == "pass_attempt_collision" for o in exec_outcomes):
         failure = "pass_attempt_collision"
     elif any(o == "pass_attempt_failed_control" for o in exec_outcomes):
         failure = "pass_attempt_failed_control"
-    elif any(o == "pass_attempt_success" for o in exec_outcomes):
-        failure = "pass_attempt_success" if not route_ok else "none"
+    elif physical_pass_success or any(o == "pass_attempt_success" for o in exec_outcomes):
+        failure = "none"
     elif passes > 0 or any(o == "pass_attempt_in_progress" for o in exec_outcomes):
         failure = "pass_attempt_incomplete"
     elif any(o == "pass_attempt_blocked_by_critic" for o in exec_outcomes):
@@ -683,10 +721,43 @@ def _execute_step_count(trace: list) -> int:
     return sum(1 for entry in trace if entry.get("node") == "execute")
 
 
+def _pass_fsm_active_in_session() -> bool:
+    """True when the CARLA pass FSM is mid-maneuver (never cut the episode early)."""
+    try:
+        from perception.carla_scenario import get_session
+        from perception.pass_control_fsm import get_pass_control_state
+
+        session = get_session()
+        if session.ready:
+            pst = get_pass_control_state(session)
+            if pst.active and pst.phase in ("prepare_pass", "lane_change", "overtake", "merge_back"):
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def route_after_execute(state: AgenticState) -> str:
     world = _world(state)
-    if world.done or _execute_step_count(state.get("trace", [])) >= state.get("max_drive_steps", 90):
+    trace = state.get("trace", [])
+    n_exec = _execute_step_count(trace)
+    if world.done or n_exec >= state.get("max_drive_steps", 90):
         return "evaluate"
+    # Don't cut the episode while a physical pass maneuver is active — let it complete.
+    if _pass_fsm_active_in_session():
+        return "planner"
+    try:
+        from perception.carla_scenario import get_session
+
+        session = get_session()
+        # Only allow corridor-end early exit after enough steps and once the pass is done.
+        if session.ready and n_exec >= 20:
+            ego = session.actors.get("ego") if session.actors else None
+            if ego is not None and hasattr(session, "approaching_corridor_end"):
+                if session.approaching_corridor_end(ego, min_horizon_m=22.0):
+                    return "evaluate"
+    except Exception:
+        pass
     return "planner"
 
 

@@ -115,6 +115,28 @@ def test_wait_during_committed_pass_continues_pass_action():
     assert not fail
 
 
+def test_wait_during_merge_back_continues_even_if_inactive_flag():
+    session = _mock_session()
+    begin_pass(session)
+    st = get_pass_control_state(session)
+    st.maneuver_started = True
+    st.phase = "merge_back"
+    st.active = False
+    session._pass_control = st
+    st2, action, fail = pass_control_tick(
+        session,
+        session.actors["ego"],
+        requested_action="wait",
+        pass_in_progress=True,
+        front_gap_m=6.0,
+        clear_of_lead=False,
+        speed_mps=6.0,
+    )
+    assert action == "pass"
+    assert not fail
+    assert st2.phase in ("merge_back", "overtake")
+
+
 def test_wait_when_pass_not_committed_resets_fsm():
     session = _mock_session()
     begin_pass(session)

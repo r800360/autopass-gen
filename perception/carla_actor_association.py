@@ -435,7 +435,13 @@ def resolve_lead_front_gap(
         "rear_gap_m": rear_gap,
         "oncoming_gap_m": oncoming_gap if oncoming_gap is not None else 999.0,
     }
-    meta["lead_speed_mps"] = _actor_speed_mps(session.actors.get("lead"))
+    lead_spd = _actor_speed_mps(session.actors.get("lead"))
+    if lead_spd is None or float(lead_spd) < 0.5:
+        if hasattr(session, "kinematic_lead_speed_mps"):
+            lead_spd = session.kinematic_lead_speed_mps()
+        else:
+            lead_spd = float(getattr(session, "_kinematic_lead_speed_mps", 0.0)) or None
+    meta["lead_speed_mps"] = lead_spd
     meta["decision_oracle"] = True
     return classified, gaps, meta
 

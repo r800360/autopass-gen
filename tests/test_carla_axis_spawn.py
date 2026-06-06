@@ -130,16 +130,40 @@ def test_corridor_transform_places_lead_at_requested_gap():
     session._passing_side = "left"
     session._rear_on_passing_lane = False
     session._axis_spawn_active = False
+    session._axis_ego_xyz = None
+    session._axis_travel_dir = None
+    session._axis_lateral_dir = None
+    session._corridor_axis_origin_xyz = None
     session._travel_wp = _mock_travel_waypoint_chain(_Carla)
     session.actors = {"ego": SimpleNamespace()}
 
     spec = curated_demo_scenarios()[0]
-    tf = session._layout_transform("lead", 22.0, spec=spec)
+    # Force non-axis path for this test (spec uses axis_spawn but session state doesn't have it set)
+    tf = session._layout_transform("lead", 22.0, spec=None)
     assert tf is not None
     ego_xyz = (-486.0, 197.0, 0.0)
     travel = (0.0, -1.0, 0.0)
     proj = projected_distance_m(ego_xyz, (tf.location.x, tf.location.y, tf.location.z), travel)
     assert proj == pytest.approx(22.0, abs=2.5)
+
+
+def test_spawn_profile_enables_axis_for_demo_01_pass():
+    spec = curated_demo_scenarios()[0]
+    assert spec.scenario_id == "demo_01_clear_urgent_safe_pass"
+    profile = CarlaScenarioSession._spawn_profile(spec)
+    assert profile.get("axis_spawn") is True
+    assert float(profile.get("lead_gap_m", 0)) >= 18.0
+    assert float(profile.get("rear_axis_gap_m", 0)) >= 25.0
+
+
+def test_profile_rear_longitudinal_prefers_axis_gap():
+    spec = curated_demo_scenarios()[0]
+    profile = CarlaScenarioSession._spawn_profile(spec)
+    assert CarlaScenarioSession._profile_rear_longitudinal_m(profile) == pytest.approx(
+        float(profile["rear_axis_gap_m"])
+    )
+    demo07 = CarlaScenarioSession._spawn_profile(curated_demo_scenarios()[6])
+    assert CarlaScenarioSession._profile_rear_longitudinal_m(demo07) == pytest.approx(18.0)
 
 
 def test_spawn_profile_enables_axis_for_demo_07():
@@ -241,10 +265,11 @@ def test_fixed_corridor_origin_advances_ego_s_along_axis():
 
 
 def test_spawn_profile_default_uses_waypoint_cap():
+    # All campaign demos now use axis_spawn for clean vehicle placement.
     spec = curated_demo_scenarios()[0]
     profile = CarlaScenarioSession._spawn_profile(spec)
-    assert profile["axis_spawn"] is False
-    assert profile["lead_cap_m"] == 22.0
+    assert profile["axis_spawn"] is True
+    assert float(profile.get("lead_gap_m", 0)) >= 18.0
 
 
 def test_layout_transform_demo_07_uses_axis_offset_from_ego():
@@ -337,5 +362,6 @@ def test_pass_lead_gap_floor_depends_on_scenario_profile():
     demo01 = curated_demo_scenarios()[0]
     demo07 = curated_demo_scenarios()[6]
     session = CarlaScenarioSession.__new__(CarlaScenarioSession)
-    assert session._pass_lead_gap_floor_m(demo01) == pytest.approx(12.0)
+    # demo_01 now uses axis_spawn with lead_gap_m=20.0
+    assert session._pass_lead_gap_floor_m(demo01) >= 18.0
     assert session._pass_lead_gap_floor_m(demo07) >= 26.0

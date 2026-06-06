@@ -75,6 +75,80 @@ def test_pass_finish_active_during_merge_back_when_axis_ahead():
     assert pass_finish_active(session, clear_of_lead=True) is False
 
 
+def test_pass_finish_active_after_long_clear_while_wide_lateral():
+    """Longitudinal clearance must not end merge-back while ego is still off travel lane."""
+    ego = SimpleNamespace(get_location=lambda: SimpleNamespace(x=0.0, y=0.0, z=0.0))
+    session = SimpleNamespace(
+        ready=True,
+        _pass_corridor_committed=True,
+        _pass_peak_shift_m=3.2,
+        expected_passing_lane_width_m=lambda: 3.5,
+        ego_cleared_lead=lambda c: True,
+        actor_travel_s=lambda name: 48.0 if name == "ego" else 32.0,
+        actors={"ego": ego},
+        lateral_lane_offsets_m=lambda ego: (18.0, 19.0, 3.5),
+    )
+    st = get_pass_control_state(session)
+    st.active = True
+    st.maneuver_started = True
+    st.phase = "merge_back"
+    assert pass_finish_active(session) is True
+
+
+def test_wide_off_corridor_detects_runaway_merge():
+    from perception.pass_geometry import wide_off_corridor
+
+    session = SimpleNamespace(
+        ready=True,
+        expected_passing_lane_width_m=lambda: 3.5,
+        lateral_lane_offsets_m=lambda ego: (130.0, 128.0, 3.5),
+    )
+    assert wide_off_corridor(session) is True
+
+
+def test_begin_pass_preserves_finish_latch():
+    from perception.pass_control_fsm import begin_pass
+
+    session = SimpleNamespace(
+        ready=True,
+        _pass_corridor_committed=True,
+        _pass_peak_shift_m=3.2,
+        _pass_finish_latch=True,
+        _passing_wp=SimpleNamespace(lane_id=4, road_id=1),
+        _travel_wp=SimpleNamespace(lane_id=5, road_id=1),
+        expected_passing_lane_width_m=lambda: 3.5,
+        ego_cleared_lead=lambda c: False,
+        actor_travel_s=lambda name: 40.0 if name == "ego" else 32.0,
+        lateral_lane_offsets_m=lambda ego: (18.0, 19.0, 3.5),
+        ego_corridor_lane_offset_m=lambda ego: 18.0,
+        map=None,
+    )
+    st = begin_pass(session)
+    assert session._pass_peak_shift_m == 3.2
+    assert st.phase == "merge_back"
+
+
+def test_beside_or_ahead_triggers_merge_back_due():
+    from perception.pass_geometry import beside_or_ahead_of_lead, pass_merge_back_due
+
+    session = SimpleNamespace(
+        ready=True,
+        _pass_corridor_committed=True,
+        _pass_peak_shift_m=3.2,
+        expected_passing_lane_width_m=lambda: 3.5,
+        ego_cleared_lead=lambda c: False,
+        actor_travel_s=lambda name: 32.6 if name == "ego" else 32.0,
+        lateral_lane_offsets_m=lambda ego: (18.0, 20.0, 3.5),
+        ego_corridor_lane_offset_m=lambda ego: 18.0,
+    )
+    st = get_pass_control_state(session)
+    st.active = True
+    st.maneuver_started = True
+    st.phase = "lane_change"
+    assert beside_or_ahead_of_lead(session, margin_m=0.5)
+    assert pass_merge_back_due(session) is True
+
+
 def test_pass_merge_back_due_on_axis_ahead():
     from perception.pass_geometry import pass_merge_back_due
 
@@ -85,12 +159,34 @@ def test_pass_merge_back_due_on_axis_ahead():
         expected_passing_lane_width_m=lambda: 3.5,
         ego_cleared_lead=lambda c: False,
         actor_travel_s=lambda name: 36.0 if name == "ego" else 32.0,
+        lateral_lane_offsets_m=lambda ego: (1.0, 1.2, 3.5),
+        ego_corridor_lane_offset_m=lambda ego: 1.0,
     )
     st = get_pass_control_state(session)
     st.active = True
     st.maneuver_started = True
     st.phase = "overtake"
     assert pass_merge_back_due(session) is True
+
+
+def test_pass_merge_back_not_due_while_behind_on_axis():
+    from perception.pass_geometry import pass_merge_back_due, safe_to_merge_to_travel
+
+    session = SimpleNamespace(
+        ready=True,
+        _pass_corridor_committed=True,
+        _pass_peak_shift_m=3.2,
+        expected_passing_lane_width_m=lambda: 3.5,
+        ego_cleared_lead=lambda c: False,
+        lead_longitudinal_gap_m=lambda: 5.0,
+        actor_travel_s=lambda name: 27.0 if name == "ego" else 32.0,
+    )
+    st = get_pass_control_state(session)
+    st.active = True
+    st.maneuver_started = True
+    st.phase = "overtake"
+    assert safe_to_merge_to_travel(session) is False
+    assert pass_merge_back_due(session) is False
 
 
 def test_axis_ahead_of_lead():

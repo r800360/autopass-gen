@@ -11,6 +11,7 @@ Under trip deadline pressure, decide **when** an AV may overtake using **only vi
 | `pytest -q` | Offline proof (perception SSOT, planner agency, graph) |
 | `python demo.py --mode multi_agent` | Agentic episode + traces (`runs/demo/`) |
 | `python demo_carla_watch.py --hero-pass --scenario clear_safe_pass` | **Canonical CARLA closed loop** + video |
+| `python scripts/run_carla_scenario_gallery.py --fast --demos 0,4,6,7` | Multi-scenario CARLA videos + `gallery_summary.json` |
 | `python -m autopass.benchmark --policies no_pass,aggressive,autopass` | Pareto time–safety comparison |
 
 ## Architecture
@@ -45,6 +46,15 @@ Under trip deadline pressure, decide **when** an AV may overtake using **only vi
 Control gains (`MAX_STEER`, lane-change blend) ship with **demo-safe defaults in code** — you should not need to tune env vars for hero videos. Optional `AUTOPASS_CARLA_*` overrides exist for ablations only.
 
 Trace field `metrics.agency` reports LLM rounds, vision-front steps, and critic/execute alignment.
+
+## Demo video (inspectable claim on frame)
+
+`demo_carla_watch.py --hero-pass` burns in each frame:
+
+- **Depth boxes** on ego RGB (green LEAD, cyan rear, orange oncoming)
+- **Belief panel**: `CAN_PASS`, vision front/rear gaps, urgency pressure, pass FSM phase, `oracle=OFF`, agency source
+
+Disable boxes with `vision_overlay: false` in recorder `extra` (off by default outside hero demo).
 
 ## North-star metric (CARLA hero corridors)
 

@@ -103,15 +103,51 @@ def evaluate_pass_gates(
         try:
             from perception.carla_scenario import get_session
             from perception.pass_control_fsm import get_pass_control_state
+            from perception.pass_geometry import axis_ahead_of_lead
 
             session = get_session()
             if session.ready:
                 pst = get_pass_control_state(session)
-                if pst.maneuver_started or getattr(session, "_pass_corridor_committed", False):
+                if (
+                    pst.maneuver_started
+                    or getattr(session, "_pass_corridor_committed", False)
+                    or getattr(session, "_pass_finish_latch", False)
+                    or axis_ahead_of_lead(session)
+                ):
                     front_gap_ok = True
         except Exception:
             pass
     slow_lead_ok = bool(lead_cleared or slow_lead(dsl, world))
+    if pass_in_progress and not slow_lead_ok and belief_is_measured(wb):
+        if wb.front_valid and wb.lead_speed_mps is not None and float(wb.lead_speed_mps) < 2.5:
+            slow_lead_ok = True
+        elif wb.front_valid and wb.front_gap_m is not None and float(wb.front_gap_m) < 48.0:
+            slow_lead_ok = True
+    if pass_in_progress and not slow_lead_ok:
+        try:
+            from perception.carla_scenario import get_session
+            from perception.pass_control_fsm import get_pass_control_state
+            from perception.pass_geometry import axis_ahead_of_lead, pass_committed_latched
+
+            session = get_session()
+            if session.ready:
+                pst = get_pass_control_state(session)
+                if pst.active and pst.maneuver_started and pst.phase in (
+                    "lane_change",
+                    "overtake",
+                    "merge_back",
+                ):
+                    slow_lead_ok = True
+                elif pass_committed_latched(session):
+                    slow_lead_ok = True
+                elif hasattr(session, "lead_longitudinal_gap_m"):
+                    axis_lead = float(session.lead_longitudinal_gap_m())
+                    if 0.0 < axis_lead < 80.0:
+                        slow_lead_ok = True
+                elif axis_ahead_of_lead(session, margin_m=0.5):
+                    slow_lead_ok = True
+        except Exception:
+            pass
 
     rear_meas = summary.get("measure_rear_gap") or {}
     rear_gap_ok = bool(wb.rear_valid and rear_meas.get("safe", False))
@@ -121,6 +157,28 @@ def evaluate_pass_gates(
             closing = 0.0
         req = 16.0 + closing * 2.0
         rear_gap_ok = float(wb.rear_gap_m) >= req
+    if pass_in_progress and not rear_gap_ok:
+        try:
+            from perception.carla_scenario import get_session
+            from perception.pass_control_fsm import get_pass_control_state
+            from perception.pass_geometry import pass_committed_latched
+
+            session = get_session()
+            if session.ready:
+                pst = get_pass_control_state(session)
+                if pst.maneuver_started and pst.phase in ("lane_change", "overtake", "merge_back"):
+                    axis_rear = None
+                    if hasattr(session, "rear_longitudinal_gap_m"):
+                        axis_rear = float(session.rear_longitudinal_gap_m())
+                    if axis_rear is not None and axis_rear >= 12.0:
+                        rear_gap_ok = True
+                    elif wb.rear_gap_m is not None and float(wb.rear_gap_m) >= 8.0:
+                        rear_gap_ok = True
+                elif pass_committed_latched(session) and wb.rear_gap_m is not None:
+                    if float(wb.rear_gap_m) >= 10.0:
+                        rear_gap_ok = True
+        except Exception:
+            pass
 
     kin = summary.get("check_kinematics") or {}
     kinematics_ok = bool(kin.get("feasible", False)) if kin else False

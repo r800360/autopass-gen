@@ -305,6 +305,11 @@ def measured_speeds(dsl: PassingDSL, world: WorldState) -> Dict[str, float]:
                 session = get_session()
                 if session.ready:
                     spd = _actor_speed_mps(session.actors.get("lead"))
+                    if spd is None or float(spd) < 0.5:
+                        if hasattr(session, "kinematic_lead_speed_mps"):
+                            spd = session.kinematic_lead_speed_mps()
+                        else:
+                            spd = float(getattr(session, "_kinematic_lead_speed_mps", 0.0))
                     if spd is not None and float(spd) >= 0.0:
                         lead = float(spd)
                         lead_ok = True
