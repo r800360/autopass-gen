@@ -66,6 +66,7 @@ class OvertakeScenario:
     lead_bp: str = "vehicle.audi.tt"
     sim_budget_s: float = 32.0
     min_follow_s: float = 2.5           # follow/deliberate before any lane change
+    ambient: int = 0                    # background Traffic-Manager vehicles (kept clear of corridor)
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +83,23 @@ _WEATHER = {
     "clear_sunrise": "ClearSunrise",
     "fog": "HardRainNoon",
 }
+
+
+def _render_size() -> Tuple[int, int]:
+    """Camera/panel resolution. Default 800x450; AUTOPASS_RENDER=hires -> 1280x720,
+    or AUTOPASS_RENDER=WxH for a custom size (e.g. 1920x1080 for the big screen)."""
+    val = os.environ.get("AUTOPASS_RENDER", "").strip().lower()
+    if val in ("hires", "hi", "hd", "720"):
+        return 1280, 720
+    if val in ("fhd", "1080", "fullhd"):
+        return 1920, 1080
+    if "x" in val:
+        try:
+            w, h = val.split("x")
+            return int(w), int(h)
+        except Exception:
+            pass
+    return 800, 450
 
 
 def _set_weather(carla, world, name: str) -> None:
@@ -335,9 +353,10 @@ def decode_depth(img) -> np.ndarray:
 # Driver.
 # ---------------------------------------------------------------------------
 class OvertakeRun:
-    def __init__(self, carla, world, scn: OvertakeScenario, out_dir: Path):
+    def __init__(self, carla, world, scn: OvertakeScenario, out_dir: Path, client=None):
         self.carla = carla
         self.world = world
+        self.client = client
         self.m = world.get_map()
         self.scn = scn
         self.out_dir = Path(out_dir)
@@ -354,6 +373,9 @@ class OvertakeRun:
         self.dt = 0.05
         # phase state
         self.phase = "follow"
+        self._merge_trigger = None
+        # render size (bump for the big screen via AUTOPASS_RENDER=hires or WxH)
+        self.render_w, self.render_h = _render_size()
         self._t_s = 0.0
         self.prev_steer = 0.0
         self.travel_lane_id = 0
@@ -361,6 +383,13 @@ class OvertakeRun:
         self.passing_side = scn.passing_side
         self.passing_opposing = bool(scn.oncoming)
         self._cap_idx = 0
+        # High-level agentic decision layer (planner + critic + mutable DSL).
+        # The safe waypoint controller + hard gates below remain the reflexive floor.
+        self.agentic = os.environ.get("AUTOPASS_AGENTIC", "1") == "1"
+        self.agent = None
+        if self.agentic:
+            from perception.overtake_agent import OvertakeAgent
+            self.agent = OvertakeAgent(two_lane=bool(scn.oncoming), urgency=scn.urgency)
 
     # ---- spawn -----------------------------------------------------------
     def _spawn(self, bp_name: str, wp, *, color: Optional[str] = None):
@@ -443,11 +472,72 @@ class OvertakeRun:
                 if onc is not None:
                     self.actors["oncoming"] = onc
 
+        if scn.ambient > 0:
+            self._spawn_ambient(travel_wp, scn.ambient)
+
         self._attach_sensors(ego)
         # settle
         for _ in range(12):
             world.tick()
         self._spectator_follow()
+
+    def _spawn_ambient(self, ego_wp, n: int) -> None:
+        """Spawn background Traffic-Manager vehicles for a lively, realistic world.
+
+        Kept clear of the ego's immediate pass corridor (no spawn within ~75 m ahead
+        or in the passing lane near the ego) so the staged overtake stays crash-free;
+        the agent still perceives them and the BEV shows real traffic.
+        """
+        carla, world = self.carla, self.world
+        if self.client is None:
+            return
+        try:
+            tm = self.client.get_trafficmanager()
+            tm_port = tm.get_port()
+        except Exception:
+            return
+        tm.set_synchronous_mode(True)  # ambient autopilot must step with the sync world
+        self._tm = tm
+        tm.set_global_distance_to_leading_vehicle(3.0)
+        ego_loc = ego_wp.transform.location
+        fwd = ego_wp.transform.get_forward_vector()
+        spawns = self.m.get_spawn_points()
+        import random
+        random.shuffle(spawns)
+        bl = world.get_blueprint_library()
+        cars = [b for b in bl.filter("vehicle.*")
+                if int(b.get_attribute("number_of_wheels")) == 4]
+        spawned = 0
+        for sp in spawns:
+            if spawned >= n:
+                break
+            dx = sp.location.x - ego_loc.x
+            dy = sp.location.y - ego_loc.y
+            dist = math.hypot(dx, dy)
+            # Hard rule for crash-free demos: clear a long box ALONG the ego's heading
+            # (road_id-independent, since CARLA segments a physical road into many road_ids).
+            # 160 m fore/aft x 9 m lateral covers the ego's lane + the passing lane for the
+            # whole staged maneuver, so a Traffic-Manager car cannot enter the corridor.
+            ahead = dx * fwd.x + dy * fwd.y
+            lateral = -dx * fwd.y + dy * fwd.x
+            if dist < 55.0 or (abs(ahead) < 160.0 and abs(lateral) < 9.0):
+                continue
+            bp = random.choice(cars)
+            if bp.has_attribute("color") and bp.get_attribute("color").recommended_values:
+                bp.set_attribute("color", random.choice(bp.get_attribute("color").recommended_values))
+            a = world.try_spawn_actor(bp, sp)
+            if a is None:
+                continue
+            a.set_autopilot(True, tm_port)
+            try:
+                tm.auto_lane_change(a, False)            # no swerving into the ego lane
+                tm.vehicle_percentage_speed_difference(a, random.uniform(-5, 25))
+                tm.ignore_lights_percentage(a, 0)
+            except Exception:
+                pass
+            self.actors[f"amb{spawned}"] = a
+            spawned += 1
+        self._ambient_count = spawned
 
     def _attach_sensors(self, ego) -> None:
         carla, world = self.carla, self.world
@@ -473,7 +563,7 @@ class OvertakeRun:
             ("overhead", "sensor.camera.rgb", over_tr),
         ]
         for name, kind, tr in specs:
-            w, h = (800, 450) if name == "overhead" else (800, 450)
+            w, h = self.render_w, self.render_h
             s = world.spawn_actor(cam(kind, w, h), tr, attach_to=ego)
             s.listen(lambda img, n=name: self._buf.__setitem__(n, img))
             self.sensors[name] = s
@@ -490,7 +580,8 @@ class OvertakeRun:
     def perceive(self) -> Dict[str, Any]:
         """Vision-grounded gaps from front + rear segmentation/depth."""
         out: Dict[str, Any] = {"front_gap_m": None, "rear_gap_m": None, "oncoming_gap_m": None,
-                               "passing_lane_ahead_gap_m": None, "front_dets": [], "lead_speed_mps": None}
+                               "passing_lane_ahead_gap_m": None, "front_dets": [], "lead_speed_mps": None,
+                               "lead_behind_m": None}
         rgb_img = self._buf.get("rgb")
         seg_img = self._buf.get("seg")
         depth_img = self._buf.get("depth")
@@ -535,6 +626,11 @@ class OvertakeRun:
                     and (abs(d["lateral_m"]) < 2.2 or -6.5 < d["lateral_m"] * side_sign < -2.0)]
             if rear:
                 out["rear_gap_m"] = round(min(d["median_depth"] for d in rear), 1)
+            # Vision merge-back cue: a vehicle (the lead just overtaken) now BEHIND us,
+            # roughly in our column. Used to trigger overtake->merge_back from vision.
+            behind = [d for d in rdets if 5.0 < d["median_depth"] < 75 and abs(d["lateral_m"]) < 5.0]
+            if behind:
+                out["lead_behind_m"] = round(min(d["median_depth"] for d in behind), 1)
         # measured lead speed (control bookkeeping; honest — from actor velocity)
         lead = self.actors.get("lead")
         if lead is not None:
@@ -700,6 +796,31 @@ class OvertakeRun:
         return {"speed": v, "steer": steer, "target_speed": target_speed,
                 "lat_to_target": lateral_offset_to_wp(tf, tgt_lane_wp)}
 
+    # ---- lane-graph tool (planner's check_corridor) ---------------------
+    def tool_check_corridor(self, horizon_m: float = 45.0, step: float = 5.0) -> Tuple[bool, float]:
+        """Walk the passing lane on the road graph; confirm it stays a driving lane,
+        non-junction, and lane-id-consistent ahead. Returns (ok, clear_ahead_m)."""
+        carla = self.carla
+        ego = self.actors["ego"]
+        cur = self.m.get_waypoint(ego.get_transform().location, project_to_road=True,
+                                  lane_type=carla.LaneType.Driving)
+        pass_wp = lane_to(carla, cur, self.passing_lane_id)
+        if pass_wp is None:
+            return False, 0.0
+        clear = 0.0
+        wp = pass_wp
+        n = int(horizon_m / step)
+        for _ in range(n):
+            nxts = wp.previous(step) if self.passing_opposing else wp.next(step)
+            if not nxts:
+                break
+            wp = nxts[0]
+            if wp.is_junction or wp.lane_type != carla.LaneType.Driving:
+                break
+            clear += step
+        ok = clear >= min(horizon_m, 30.0)
+        return ok, clear
+
     # ---- phase transitions ---------------------------------------------
     def update_phase(self, gaps: Dict[str, Any], decision: str) -> None:
         carla = self.carla
@@ -720,8 +841,15 @@ class OvertakeRun:
             if d_pass < 0.6 and cur_wp.lane_id == self.passing_lane_id:
                 self.phase = "overtake"
         elif self.phase == "overtake":
-            # ahead of lead by a safe margin -> merge back (generous so we never clip the lead)
-            if long_to_lead < -12.0:
+            # VISION sets the timing: the rear camera must confirm the just-overtaken lead is
+            # clearly BEHIND us. A DETERMINISTIC safety precondition guarantees we are genuinely
+            # past the lead before merging (never cut in) — vision proposes, code verifies. A sim
+            # upper-bound fallback ensures we can never overtake forever if vision misses.
+            lead_behind = gaps.get("lead_behind_m")
+            ego_past_lead = long_to_lead < -7.0          # ego clearly ahead of the lead (safety)
+            vision_clear = lead_behind is not None and lead_behind >= 12.0
+            if (vision_clear and ego_past_lead) or long_to_lead < -22.0:
+                self._merge_trigger = "vision" if (vision_clear and ego_past_lead) else "sim_fallback"
                 self.phase = "merge_back"
         elif self.phase == "merge_back":
             if d_travel < 0.6 and cur_wp.lane_id == self.travel_lane_id:
@@ -787,12 +915,20 @@ class OvertakeRun:
             gaps = self.perceive()
             self.drive_npcs()
             if self.phase == "follow" and tick % decide_every == 0:
-                gates = self.evaluate_gates(gaps)
-                decision, reasoning = self.decide(gaps, gates)
-                self.trace.append({
-                    "tick": tick, "t_s": round(tick * self.dt, 2), "phase": self.phase,
-                    "gaps": gaps, "gates": gates, "decision": decision, "reasoning": reasoning,
-                })
+                if self.agent is not None:
+                    # Agentic path: planner chooses tools, critic verifies, DSL mutates.
+                    self.agent.dsl.age_all(0.5)
+                    cyc = self.agent.deliberate(self, gaps, tick)
+                    decision, reasoning = cyc["decision"], cyc["reasoning"]
+                    gates = cyc["gates"]
+                    self.trace.append(cyc)
+                else:
+                    gates = self.evaluate_gates(gaps)
+                    decision, reasoning = self.decide(gaps, gates)
+                    self.trace.append({
+                        "tick": tick, "t_s": round(tick * self.dt, 2), "phase": self.phase,
+                        "gaps": gaps, "gates": gates, "decision": decision, "reasoning": reasoning,
+                    })
             ego_ctrl = self.drive_ego(gaps)
             self.world.tick()
             self.update_phase(gaps, decision)
@@ -818,8 +954,16 @@ class OvertakeRun:
             f"onc={gaps.get('oncoming_gap_m')}m lead_v={gaps.get('lead_speed_mps')}m/s",
             f"CAN_PASS={'YES' if gates.get('can_pass') else 'no'}  DECISION={decision.upper()}",
             f"ego_v={ego_ctrl['speed']:.1f}->{ego_ctrl['target_speed']:.0f}m/s steer={ego_ctrl['steer']:+.2f}",
-            f"why: {reasoning[:64]}",
         ]
+        if self.agent is not None:
+            dsl = self.agent.dsl
+            tools = self.agent.last_tools or []
+            lines.append("PLAN: " + (" > ".join(tools)[:58] if tools else "(deliberating)"))
+            crit = "APPROVE" if decision == "pass" else "hold/reject"
+            lines.append(f"CRITIC: {crit}  denials={dsl.denials}  DSLrev={dsl.revision}")
+            lines.append(f"why: {reasoning[:60]}")
+        else:
+            lines.append(f"why: {reasoning[:64]}")
         if gates.get("blockers"):
             lines.append("BLOCK: " + "; ".join(gates["blockers"])[:60])
         return lines
@@ -847,7 +991,17 @@ class OvertakeRun:
             "passing_side": self.passing_side,
             "success": completed,
             "frames": self._cap_idx,
+            "merge_trigger": self._merge_trigger,
         }
+        if self.agent is not None:
+            dsl = self.agent.dsl
+            result["agency"] = {
+                "deliberation_cycles": dsl.cycles,
+                "tool_calls": len(dsl.tool_history),
+                "tool_histogram": {t: dsl.tool_history.count(t) for t in sorted(set(dsl.tool_history))},
+                "critic_denials": dsl.denials,
+                "dsl_revisions": dsl.revision,
+            }
         return result
 
     def write_video(self, name: str, fps: int = 18) -> Optional[Path]:
@@ -865,6 +1019,11 @@ class OvertakeRun:
         return out
 
     def teardown(self) -> None:
+        try:
+            if getattr(self, "_tm", None) is not None:
+                self._tm.set_synchronous_mode(False)
+        except Exception:
+            pass
         for s in self.sensors.values():
             try:
                 s.stop(); s.destroy()
@@ -883,7 +1042,7 @@ def run_scenario(scn: OvertakeScenario, out_dir: Path, *, host="127.0.0.1", port
     client = carla.Client(host, port)
     client.set_timeout(30.0)
     world, prev = load_world(carla, client, scn.town)
-    run = OvertakeRun(carla, world, scn, out_dir)
+    run = OvertakeRun(carla, world, scn, out_dir, client=client)
     try:
         run.setup()
         result = run.run()

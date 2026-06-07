@@ -111,7 +111,7 @@ _LIST = [
          narrative="Town04 motorway: lead is NOT slow (cruising fast) — correctly decline to overtake.",
          urgency="high", expected="wait", lead_speed_mps=12.5, ego_cruise_mps=14.0,
          ego_pass_mps=20.0, lead_gap_m=28.0, passing_side="left", corridor_rank=2,
-         weather="clear_noon"),
+         weather="clear_noon", sim_budget_s=16.0),
     _scn(scenario_id="s17_t04_reject_rear_traffic", town="Town04",
          narrative="Town04 motorway: a fast vehicle is closing in the passing lane — yield, let it pass, then overtake once clear.",
          urgency="high", expected="wait", lead_speed_mps=6.0, ego_cruise_mps=13.0,
@@ -121,7 +121,7 @@ _LIST = [
          narrative="Town05 arterial: lead matches traffic speed — overtaking is not warranted, keep lane.",
          urgency="high", expected="wait", lead_speed_mps=11.0, ego_cruise_mps=12.5,
          ego_pass_mps=17.0, lead_gap_m=26.0, passing_side="left", corridor_rank=12,
-         weather="clear_noon"),
+         weather="clear_noon", sim_budget_s=16.0),
     _scn(scenario_id="s19_t01_rural_oncoming_reject", town="Town01",
          narrative="Town01 rural two-lane: oncoming traffic in the only passing lane — wait for it to clear, then overtake.",
          urgency="high", expected="wait", lead_speed_mps=4.0, ego_cruise_mps=10.0,
@@ -132,7 +132,24 @@ _LIST = [
          narrative="Town03 urban: lead is keeping pace with traffic — decline the overtake, stay in lane.",
          urgency="high", expected="wait", lead_speed_mps=10.0, ego_cruise_mps=11.5,
          ego_pass_mps=16.0, lead_gap_m=24.0, passing_side="left", corridor_rank=2,
-         weather="clear_noon"),
+         weather="clear_noon", sim_budget_s=16.0),
+    # --- agency / ambient-traffic / complexity showcases -------------------
+    _scn(scenario_id="s21_t04_highway_ambient_pass", town="Town04",
+         narrative="Town04 motorway with live ambient traffic: gather evidence, verify the lane is clear, then overtake.",
+         urgency="high", expected="pass", lead_speed_mps=5.0, ego_cruise_mps=14.0,
+         ego_pass_mps=20.0, lead_gap_m=26.0, passing_side="left", corridor_rank=0,
+         ambient=16, weather="clear_noon", sim_budget_s=34.0),
+    _scn(scenario_id="s22_t04_highway_heavy_traffic_pass", town="Town04",
+         narrative="Town04 motorway, heavy ambient traffic: gather evidence across cycles and overtake only once verified clear.",
+         urgency="high", expected="pass", lead_speed_mps=5.0, ego_cruise_mps=13.0,
+         ego_pass_mps=18.0, lead_gap_m=24.0, passing_side="left", corridor_rank=3,
+         ambient=22, weather="cloudy_noon", sim_budget_s=34.0),
+    _scn(scenario_id="s23_t04_highway_truck_pass", town="Town04",
+         narrative="Town04 motorway: overtake a slow heavy truck — large lead, longer maneuver.",
+         urgency="high", expected="pass", lead_speed_mps=5.0, ego_cruise_mps=15.0,
+         ego_pass_mps=21.0, lead_gap_m=28.0, passing_side="left", corridor_rank=2,
+         lead_bp="vehicle.carlamotors.firetruck", ambient=8, weather="clear_noon",
+         sim_budget_s=36.0),
 ]
 
 SCENARIOS = {s.scenario_id: s for s in _LIST}
@@ -144,10 +161,16 @@ def main() -> int:
     ap.add_argument("--out-dir", type=Path, default=Path("runs/clean_overtake"))
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--mock", action="store_true", help="Mock LLM (fast control-only iteration)")
+    ap.add_argument("--hires", action="store_true", help="Render at 1280x720 for the big screen")
+    ap.add_argument("--render", default="", help="Custom render size WxH (e.g. 1920x1080)")
     args = ap.parse_args()
 
     if args.mock:
         os.environ["AUTOPASS_MOCK_LLM"] = "1"
+    if args.render:
+        os.environ["AUTOPASS_RENDER"] = args.render
+    elif args.hires:
+        os.environ["AUTOPASS_RENDER"] = "hires"
 
     import json
     if args.all:

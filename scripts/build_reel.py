@@ -48,19 +48,29 @@ def main() -> int:
     camp = Path(sys.argv[1])
     out = Path(sys.argv[2]) if len(sys.argv) > 2 else camp / "presentation_reel.mp4"
     summary = json.loads((camp / "summary.json").read_text(encoding="utf-8"))
-    import imageio.v3 as iio
+    import imageio.v2 as iio
 
-    frames: list[np.ndarray] = []
+    # Lock the reel canvas to the FIRST scenario's frame size; every frame is
+    # resized to it so the stream never changes dimensions mid-write.
     W = H = None
+    for r in summary:
+        paths = sorted((camp / r["scenario_id"] / "frames").glob("frame_*.png"))
+        if paths:
+            H, W = np.array(Image.open(paths[0])).shape[:2]
+            break
+    if W is None:
+        print("no frames found")
+        return 1
+
+    writer = iio.get_writer(out, fps=FPS, codec="libx264", macro_block_size=16,
+                            quality=7, ffmpeg_log_level="error")
     n_used = 0
+    n_frames = 0
     for r in summary:
         sid = r["scenario_id"]
-        fdir = camp / sid / "frames"
-        paths = sorted(fdir.glob("frame_*.png"))
+        paths = sorted((camp / sid / "frames").glob("frame_*.png"))
         if not paths:
             continue
-        sample = np.array(Image.open(paths[0]))
-        H, W = sample.shape[:2]
         outcome = "OVERTAKE COMPLETED" if r.get("expected") == "pass" else "HELD / DECLINED (safety)"
         verdict = "PASS" if r.get("success") else "REVIEW"
         card = title_card(W, H, [
@@ -69,21 +79,19 @@ def main() -> int:
             f"[{verdict}]  lane_dev<={r.get('max_lane_dev_m')}m  collision={r.get('collision')}",
         ])
         for _ in range(int(TITLE_SECONDS * FPS)):
-            frames.append(card)
+            writer.append_data(card)
+            n_frames += 1
         for p in paths:
-            a = np.array(Image.open(p))
+            a = np.array(Image.open(p).convert("RGB"))
             if a.shape[:2] != (H, W):
                 a = np.array(Image.fromarray(a).resize((W, H)))
-            frames.append(a)
+            writer.append_data(a)
+            n_frames += 1
         n_used += 1
-
-    if not frames:
-        print("no frames found")
-        return 1
-    # macro-block safe sizing
-    iio.imwrite(out, frames, fps=FPS, codec="libx264", macro_block_size=16)
-    print(f"wrote {out}: {n_used} scenarios, {len(frames)} frames @ {FPS}fps "
-          f"(~{len(frames)/FPS:.0f}s)")
+        print(f"  + {sid} ({len(paths)} frames)")
+    writer.close()
+    print(f"wrote {out}: {n_used} scenarios, {n_frames} frames @ {FPS}fps "
+          f"(~{n_frames/FPS:.0f}s)")
     return 0
 
 
