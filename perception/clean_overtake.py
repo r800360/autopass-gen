@@ -31,7 +31,8 @@ from perception.carla_lane_keep import pure_pursuit_steer
 # Safety constants (shared with the rest of the project's gate logic).
 # ---------------------------------------------------------------------------
 MIN_PASS_FRONT_GAP_M = 18.0   # need this much clear road ahead before committing
-SLOW_LEAD_MAX_MPS = 9.0       # only overtake a genuinely slower lead
+MIN_PASS_SPEED_DELTA_MPS = 4.0  # warrant gate: lead must be this much slower than cruise
+SLOW_LEAD_MAX_MPS = 9.0       # legacy fallback only, used if cruise speed is unavailable
 REAR_SAFE_BASE_M = 12.0       # passing-lane rear gap floor
 ONCOMING_SAFE_M = 45.0        # opposing-lane clearance needed for opposite-side pass
 
@@ -385,11 +386,21 @@ class OvertakeRun:
         self._cap_idx = 0
         # High-level agentic decision layer (planner + critic + mutable DSL).
         # The safe waypoint controller + hard gates below remain the reflexive floor.
-        self.agentic = os.environ.get("AUTOPASS_AGENTIC", "1") == "1"
+        # Decision policy: "autopass" (ours), "no_pass" (never overtake),
+        # "aggressive" (overtake regardless of safety gates) - the last two are baselines.
+        self.policy = os.environ.get("AUTOPASS_POLICY", "autopass")
+        self.agentic = (os.environ.get("AUTOPASS_AGENTIC", "1") == "1") and self.policy == "autopass"
         self.agent = None
         if self.agentic:
             from perception.overtake_agent import OvertakeAgent
             self.agent = OvertakeAgent(two_lane=bool(scn.oncoming), urgency=scn.urgency)
+        # benchmark metrics
+        self._speeds: List[float] = []
+        self._cleared_lead = False
+        self._time_to_clear = None
+        self._pass_attempted = False
+        self._unsafe_pass_attempt = False
+        self._unwarranted_pass = False
 
     # ---- spawn -----------------------------------------------------------
     def _spawn(self, bp_name: str, wp, *, color: Optional[str] = None):
@@ -644,16 +655,41 @@ class OvertakeRun:
         onc = gaps.get("oncoming_gap_m")
         pahead = gaps.get("passing_lane_ahead_gap_m")
         lead_v = gaps.get("lead_speed_mps")
+        desired_v = float(getattr(self.scn, "ego_cruise_mps", 0.0) or 0.0)
+        speed_delta = None if lead_v is None else round(desired_v - lead_v, 2)
+
         front_ok = front is not None and front >= MIN_PASS_FRONT_GAP_M
-        slow_ok = lead_v is not None and lead_v <= SLOW_LEAD_MAX_MPS
+
+        # Warrant gate, not a safety gate:
+        # Prefer a road-relative rule: pass only when the lead is meaningfully slower
+        # than the desired cruise speed. Fall back to the old 9 m/s absolute threshold
+        # only if desired cruise speed is unavailable.
+        if lead_v is None:
+            slow_ok = False
+        elif desired_v > 0.0:
+            slow_ok = speed_delta >= MIN_PASS_SPEED_DELTA_MPS
+        else:
+            slow_ok = lead_v <= SLOW_LEAD_MAX_MPS
+
         rear_ok = rear is None or rear >= REAR_SAFE_BASE_M  # None = nothing seen behind
         onc_ok = (not self.scn.oncoming) or (onc is None or onc >= ONCOMING_SAFE_M)
         pclear_ok = pahead is None or pahead >= 24.0  # passing lane clear ahead
         blockers = []
         if not front_ok:
             blockers.append(f"front gap {front}m < {MIN_PASS_FRONT_GAP_M:.0f}m" if front is not None else "front gap unmeasured")
+        # if not slow_ok:
+        #     blockers.append(f"lead not slow ({lead_v} m/s)" if lead_v is not None else "lead speed unknown")
         if not slow_ok:
-            blockers.append(f"lead not slow ({lead_v} m/s)" if lead_v is not None else "lead speed unknown")
+            if lead_v is None:
+                blockers.append("lead speed unknown")
+            elif desired_v > 0.0:
+                blockers.append(
+                    f"lead not slow enough: cruise={desired_v:.1f} m/s, "
+                    f"lead={lead_v:.1f} m/s, delta={speed_delta:.1f} m/s "
+                    f"< {MIN_PASS_SPEED_DELTA_MPS:.1f} m/s"
+                )
+            else:
+                blockers.append(f"lead not slow ({lead_v:.1f} m/s > {SLOW_LEAD_MAX_MPS:.1f} m/s fallback)")
         if not rear_ok:
             blockers.append(f"passing-lane rear gap {rear}m < {REAR_SAFE_BASE_M:.0f}m")
         if not onc_ok:
@@ -662,9 +698,18 @@ class OvertakeRun:
             blockers.append(f"passing lane blocked ahead ({pahead}m)")
         can_pass = front_ok and slow_ok and rear_ok and onc_ok and pclear_ok
         return {
-            "front_gap_ok": front_ok, "slow_lead_ok": slow_ok, "rear_gap_ok": rear_ok,
-            "oncoming_ok": onc_ok, "passing_clear_ok": pclear_ok,
-            "can_pass": can_pass, "blockers": blockers,
+            "front_gap_ok": front_ok,
+            "slow_lead_ok": slow_ok,
+            "warrant_ok": slow_ok,
+            "desired_speed_mps": round(desired_v, 2) if desired_v > 0.0 else None,
+            "lead_speed_mps": lead_v,
+            "speed_delta_mps": speed_delta,
+            "min_pass_speed_delta_mps": MIN_PASS_SPEED_DELTA_MPS,
+            "rear_gap_ok": rear_ok,
+            "oncoming_ok": onc_ok,
+            "passing_clear_ok": pclear_ok,
+            "can_pass": can_pass,
+            "blockers": blockers,
         }
 
     # ---- agentic decision (LLM judgment, gate-clamped) ------------------
@@ -857,6 +902,8 @@ class OvertakeRun:
 
     # ---- recording ------------------------------------------------------
     def capture(self, hud: List[str], dets: List[dict]) -> None:
+        if os.environ.get("AUTOPASS_NO_VIDEO") == "1":
+            return  # benchmark mode: skip frame capture for speed
         from perception.vision_demo_overlay import compose_demo_frame
         from perception.carla_recorder import _stack_views
         rgb_img = self._buf.get("rgb")
@@ -915,7 +962,16 @@ class OvertakeRun:
             gaps = self.perceive()
             self.drive_npcs()
             if self.phase == "follow" and tick % decide_every == 0:
-                if self.agent is not None:
+                gates = self.evaluate_gates(gaps)
+                if self.policy == "no_pass":
+                    decision, reasoning = "wait", "no-pass baseline: never overtake"
+                    self.trace.append({"tick": tick, "t_s": round(tick * self.dt, 2), "phase": self.phase,
+                                       "gaps": gaps, "gates": gates, "decision": decision, "reasoning": reasoning})
+                elif self.policy == "aggressive":
+                    decision, reasoning = "pass", "aggressive baseline: overtake regardless of gaps"
+                    self.trace.append({"tick": tick, "t_s": round(tick * self.dt, 2), "phase": self.phase,
+                                       "gaps": gaps, "gates": gates, "decision": decision, "reasoning": reasoning})
+                elif self.agent is not None:
                     # Agentic path: planner chooses tools, critic verifies, DSL mutates.
                     self.agent.dsl.age_all(0.5)
                     cyc = self.agent.deliberate(self, gaps, tick)
@@ -923,7 +979,6 @@ class OvertakeRun:
                     gates = cyc["gates"]
                     self.trace.append(cyc)
                 else:
-                    gates = self.evaluate_gates(gaps)
                     decision, reasoning = self.decide(gaps, gates)
                     self.trace.append({
                         "tick": tick, "t_s": round(tick * self.dt, 2), "phase": self.phase,
@@ -931,8 +986,28 @@ class OvertakeRun:
                     })
             ego_ctrl = self.drive_ego(gaps)
             self.world.tick()
+            prev_phase = self.phase
             self.update_phase(gaps, decision)
+            if prev_phase == "follow" and self.phase == "lane_change":
+                self._pass_attempted = True
+                # Distinguish a genuinely UNSAFE pass (entered a lane with a rear / oncoming /
+                # blocker hazard) from a merely UNWARRANTED pass (target lane clear, but the lead
+                # was not slow enough to be worth overtaking). Only the former risks a collision.
+                hazard_ok = (gates.get("rear_gap_ok") and gates.get("oncoming_ok")
+                             and gates.get("passing_clear_ok"))
+                warrant_ok = gates.get("warrant_ok", gates.get("slow_lead_ok"))
+                if not hazard_ok:
+                    self._unsafe_pass_attempt = True
+                elif not warrant_ok:
+                    self._unwarranted_pass = True
             self.track_compliance()
+            _ego = self.actors.get("ego"); _lead = self.actors.get("lead")
+            if _ego is not None:
+                self._speeds.append(speed_mps(_ego.get_velocity()))
+                if _lead is not None and not self._cleared_lead:
+                    if signed_longitudinal(_ego.get_transform(), _lead.get_transform().location) < -3.0:
+                        self._cleared_lead = True
+                        self._time_to_clear = round(self._t_s, 2)
             if tick % capture_every == 0:
                 hud = self._hud(tick, gaps, gates, decision, reasoning, ego_ctrl)
                 self.capture(hud, gaps.get("front_dets", []))
@@ -992,6 +1067,14 @@ class OvertakeRun:
             "success": completed,
             "frames": self._cap_idx,
             "merge_trigger": self._merge_trigger,
+            "policy": self.policy,
+            "overtake_completed": bool(self._cleared_lead and not self.collision and not self.offroad),
+            "mean_speed_mps": round(sum(self._speeds) / max(1, len(self._speeds)), 2),
+            "cleared_lead": self._cleared_lead,
+            "time_to_clear_s": self._time_to_clear,
+            "pass_attempted": self._pass_attempted,
+            "unsafe_pass_attempt": self._unsafe_pass_attempt,
+            "unwarranted_pass": self._unwarranted_pass,
         }
         if self.agent is not None:
             dsl = self.agent.dsl

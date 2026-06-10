@@ -105,3 +105,4 @@ sensor_dumps/
 .cursor*
 CLAUDE*
 CURSOR*
+.openai_key
